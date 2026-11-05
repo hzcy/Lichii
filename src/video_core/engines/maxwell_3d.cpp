@@ -866,6 +866,8 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
+    bool instance_loop{};
 };
 
 namespace {
@@ -962,6 +964,12 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     if (method == MAXWELL3D_REG_INDEX(shadow_ram_control) && FrontVerifyEnabled()) [[unlikely]] {
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
+    }
+    if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
+        if (Profile::Enabled()) [[unlikely]] {
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
+        }
+        return;
     }
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
@@ -1172,6 +1180,37 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
+}
+
+bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(draw.begin):
+        // Instance id, bits 27:26: First leaves an instance loop, Subsequent enters one.
+        if (((value >> 26) & 3) == 0) {
+            fs.instance_loop = false;
+        } else if (((value >> 26) & 3) == 1) {
+            fs.instance_loop = true;
+        }
+        return false;
+    case MAXWELL3D_REG_INDEX(draw_inline_index):
+    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+        fs.instance_loop = false; // DrawMode::InlineIndex: draw.end draws
+        return false;
+    case MAXWELL3D_REG_INDEX(draw.end):
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+    case MAXWELL3D_REG_INDEX(index_buffer.first):
+        break;
+    default:
+        return false;
+    }
+    if (!fs.skip_same || !shadow_kept || fs.regs[method] != value) {
+        return false;
+    }
+    // Instance loop methods flush no deferred draw, and the draw manager ignores these: DrawEnd
+    // draws nothing in an instance loop, and it only reads the buffer firsts and counts.
+    return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
 }
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
