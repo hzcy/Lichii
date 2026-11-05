@@ -1056,7 +1056,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         return;
     }
     if (amount != 0) {
-        FrontTrackInstanceLoop(fs, method, base_start[amount - 1]);
+        // The value the back acts on: in Replay mode, the shadow copy rather than the word.
+        FrontTrackInstanceLoop(fs, method,
+                               fs.control == Regs::ShadowRamControl::Replay
+                                   ? fs.shadow[method]
+                                   : base_start[amount - 1]);
     }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
