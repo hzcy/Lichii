@@ -134,8 +134,6 @@ struct WordManager {
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
-            const u64 before_cpu = affects_upload ? CpuWord(index) : 0;
-            const u64 before_untracked = affects_upload ? UntrackedWord(index) : 0;
             if (type == Type::CPU || type == Type::CachedCPU) {
                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
             }
@@ -169,7 +167,8 @@ struct WordManager {
     /// @param size            Size in bytes of the CPU range to loop over
     /// @param func            Function to call for each turned off region
     template <typename Func>
-    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
+    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size,
+                              Func&& func, bool affects_upload = true) {
         //static_assert(type != Type::Untracked);
         if (type == Type::CPU && upload_words == 0) {
             return;

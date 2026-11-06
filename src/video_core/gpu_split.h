@@ -297,7 +297,7 @@ public:
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
     /// `flags`: FastDrawNeutral when `func` can't change what a draw resolves to.
     template <typename Func>
-    void Defer(const Func& func) {
+    void Defer(const Func& func, u64 flags = 0) {
         static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
         constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
         u64* const entry = Reserve(2 + payload);
@@ -511,8 +511,6 @@ private:
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
     std::jthread back_thread;
-    alignas(128) std::atomic<bool> front_waiting{};
-    std::atomic<u32> front_wake{};
 };
 
 } // namespace VideoCommon
