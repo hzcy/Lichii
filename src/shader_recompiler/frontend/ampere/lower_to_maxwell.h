@@ -28,6 +28,8 @@ enum class TessellationStage {
 struct LoweringOptions {
     bool geometry{};
     bool tensor{};
+    /// Reject matrix multiplies instead of emulating them (KeplerCompute::EmulatesNativeTensorPrograms).
+    bool reject_matrix{};
     u64 native_code_address{};
     std::span<const u32> verified_traps{};
     TessellationStage tessellation_stage = TessellationStage::None;
@@ -1768,6 +1770,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         case 0x23c: { // HMMA.1688/.16816.F16, software warp expansion (no tensor extension required).
+            if (options.reject_matrix) return fail(index, "native matrix multiply (not emulated on this host)");
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8), c = insn.Bits(64, 8);
             const u32 mode = insn.words[2] & ~0xffU;
             const u32 depth = mode == 0 ? 8U : 16U;

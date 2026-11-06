@@ -140,6 +140,7 @@ public:
                                const Tegra::Engines::Fermi2D::Config& copy_config) override;
     bool SupportsGameDlssNetwork() const override;
     bool UsesNvidiaDlss() const override;
+    bool EmulatesNativeTensorPrograms() const override;
     bool CanProbeGameDlssOutput() const override {
         return true;
     }

@@ -332,3 +332,11 @@ TEST_CASE("Native matrix lowering selects compact software helpers without legac
     code[0].words[0] += 1U << 24;
     REQUIRE_FALSE(static_cast<bool>(Ampere::LowerToMaxwell(code, false, true)));
 }
+
+TEST_CASE("Native matrix lowering rejects matrix multiplies when asked", "[video_core][tensor][ampere]") {
+    const std::array<Ampere::Instruction, 2> code{{
+        {{0x0810723c, 12, 0x8ff, 0}}, {{0x0000794d, 0, 0x03800000, 0}}}};
+    const auto rejected = Ampere::LowerToMaxwell(code, {.tensor = true, .reject_matrix = true});
+    REQUIRE_FALSE(static_cast<bool>(rejected));
+    REQUIRE(rejected.error.find("matrix multiply") != std::string_view::npos);
+}

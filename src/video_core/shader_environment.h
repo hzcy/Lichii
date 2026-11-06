@@ -113,6 +113,8 @@ protected:
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                           bool geometry_stage);
     size_t native_source_size{};
+    /// Reject matrix multiplies (KeplerCompute::EmulatesNativeTensorPrograms).
+    bool reject_native_matrix{};
     std::shared_ptr<const LoweredNativeCode> lowered_native;
 
     Tegra::Texture::TICEntry ReadTextureInfo(GPUVAddr tic_addr, u32 tic_limit,

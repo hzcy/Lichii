@@ -2868,6 +2868,10 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
     ImageId dst_id;
     ImageId src_id;
     RelaxedOptions try_options = FIND_OPTIONS;
+    // A packed RGB9E5 frame is written as R32_UINT storage: read it through an RGB9E5 view.
+    if (src_info.format == PixelFormat::E5B9G9R9_FLOAT) {
+        try_options |= RelaxedOptions::Format;
+    }
     if (can_be_depth_blit) {
         try_options |= RelaxedOptions::Format;
     }

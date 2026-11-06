@@ -541,6 +541,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     auto lowered = Shader::Ampere::LowerToMaxwell(
         native, {.geometry = geometry_stage,
                  .tensor = true,
+                 .reject_matrix = reject_native_matrix,
                  .native_code_address = program_base + native_header_size,
                  .verified_traps = verified_traps,
                  .tessellation_stage = tessellation_stage});
@@ -939,6 +940,7 @@ ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_com
     if (kepler_compute->IsNativeMode()) {
         initial_offset = sizeof(sph);
         is_proprietary_driver = true;
+        reject_native_matrix = !kepler_compute->EmulatesNativeTensorPrograms();
         InitializeNativeCode(std::move(lowered_native_), 0);
         start_address = sizeof(sph);
     }
