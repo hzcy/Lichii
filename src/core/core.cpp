@@ -418,6 +418,12 @@ struct System::Impl {
                                               : Common::WallClock::CNTFRQ;
         Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
         LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
+        // The guest clocks derive from the host TSC calibration (or the OS clock). A wrong rate
+        // there skews every guest timer by a constant factor (#105), so record what was measured:
+        // tsc vs the CPUID base/max frequency is a sanity check at a glance.
+        LOG_INFO(Core, "Host clock: tsc {} Hz, cpu base {} MHz, max {} MHz, invariant {}",
+                 Common::g_cpu_caps.tsc_frequency, Common::g_cpu_caps.base_frequency,
+                 Common::g_cpu_caps.max_frequency, Common::g_cpu_caps.invariant_tsc);
 
         InitializeKernel(system);
 
