@@ -822,6 +822,35 @@ struct Values {
     SwitchableSetting<bool> enable_accurate_vibrations{linkage, false, "enable_accurate_vibrations",
                                                        Category::Controls};
 
+    // RenHDrum HD Rumble (Switch Pro Controller / Joy-Con) and DualSense haptics. Defaults are
+    // Ryuhdr 0.2.6's recommended mode. Read by the SDL driver on every vibration, so a change in
+    // the HD Rumble dialog applies to connected controllers right away.
+    Setting<bool> hd_rumble_enabled{linkage, true, "hd_rumble_enabled", Category::Controls};
+    // Amplitude gain in percent for everything RenHDrum plays. Switchable: some Switch 2 games
+    // (Ocarina of Time) send amplitudes below 0.1 that the Joy-Con 2 still plays strongly.
+    SwitchableSetting<int> hd_rumble_gain{linkage, 100, "hd_rumble_gain", Category::Controls};
+    // 0-100: lifts weak vibrations more than strong ones (power curve after the gain).
+    SwitchableSetting<int> hd_rumble_low_boost{linkage, 0, "hd_rumble_low_boost",
+                                               Category::Controls};
+    Setting<int> hd_rumble_usb_interval_ms{linkage, 15, "hd_rumble_usb_interval_ms", Category::Controls};
+    Setting<bool> hd_rumble_envelope_5ms{linkage, true, "hd_rumble_envelope_5ms",
+                                         Category::Controls};
+    Setting<bool> hd_rumble_frequency_in_packet{linkage, true, "hd_rumble_frequency_in_packet",
+                                                Category::Controls};
+    Setting<bool> hd_rumble_crisp_notes{linkage, true, "hd_rumble_crisp_notes",
+                                        Category::Controls};
+    Setting<int> hd_rumble_bluetooth_level{linkage, 3, "hd_rumble_bluetooth_level", Category::Controls};
+    Setting<bool> hd_rumble_bt_after_input{linkage, true, "hd_rumble_bt_after_input",
+                                           Category::Controls};
+    Setting<bool> hd_rumble_bt_fast{linkage, true, "hd_rumble_bt_fast", Category::Controls};
+    Setting<bool> hd_rumble_bt_crisp_notes{linkage, true, "hd_rumble_bt_crisp_notes",
+                                           Category::Controls};
+    Setting<bool> dualsense_haptics_enabled{linkage, true, "dualsense_haptics_enabled",
+                                            Category::Controls};
+    Setting<int> dualsense_haptics_volume{linkage, 100, "dualsense_haptics_volume", Category::Controls};
+    Setting<bool> dualsense_crisp_notes{linkage, true, "dualsense_crisp_notes",
+                                        Category::Controls};
+
     SwitchableSetting<bool> motion_enabled{linkage, true, "motion_enabled", Category::Controls};
     Setting<std::string> udp_input_servers{linkage, "127.0.0.1:26760", "udp_input_servers",
                                            Category::Controls};

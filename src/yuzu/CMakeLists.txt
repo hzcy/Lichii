@@ -140,6 +140,8 @@ add_executable(yuzu
     configuration/configure_ui.cpp
     configuration/configure_ui.h
     configuration/configure_ui.ui
+    configuration/configure_hd_rumble.cpp
+    configuration/configure_hd_rumble.h
     configuration/configure_vibration.cpp
     configuration/configure_vibration.h
     configuration/configure_vibration.ui
@@ -481,3 +483,18 @@ endif()
 target_link_libraries(yuzu PRIVATE OpenSSL::SSL OpenSSL::Crypto SDL3::SDL3)
 
 create_target_directory_groups(yuzu)
+
+if (ENABLE_RENHDRUM AND RENHDRUM_DOWNLOAD AND WIN32)
+    set(RENHDRUM_VERSION 0.1.1)
+    set(RENHDRUM_DLL "${CMAKE_BINARY_DIR}/renhdrum/${RENHDRUM_VERSION}/renhdrum.dll")
+    if (NOT EXISTS "${RENHDRUM_DLL}")
+        file(DOWNLOAD
+            "https://github.com/trzz1214/RenHDrum/releases/download/v${RENHDRUM_VERSION}/renhdrum.dll"
+            "${RENHDRUM_DLL}"
+            EXPECTED_HASH SHA256=b087712e84d481800e31578130a7d82c7811ad1d10f897504a8e7a8ec49489ce
+            SHOW_PROGRESS)
+    endif()
+    add_custom_command(TARGET yuzu POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${RENHDRUM_DLL}" "$<TARGET_FILE_DIR:yuzu>"
+        VERBATIM)
+endif()

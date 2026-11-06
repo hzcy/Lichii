@@ -248,6 +248,18 @@ endif()
 
 option(YUZU_USE_BUNDLED_SDL3 "Download bundled SDL3 build" ${EXT_DEFAULT})
 
+# RenHDrum (https://github.com/trzz1214/RenHDrum): HD Rumble for Switch controllers and audio
+# haptics for a wired DualSense. The library is loaded at runtime; without it the standard rumble
+# is used.
+option(ENABLE_RENHDRUM "Play controller vibration through RenHDrum when renhdrum.dll is present" ON)
+option(RENHDRUM_DOWNLOAD "Download the prebuilt renhdrum.dll next to the executable (Windows x64)" OFF)
+cmake_dependent_option(RENHDRUM_SDL_PATCHES
+    "Build SDL3 from source with RenHDrum's HD Rumble transport patches" OFF "ENABLE_RENHDRUM" OFF)
+if (RENHDRUM_SDL_PATCHES AND YUZU_USE_BUNDLED_SDL3)
+    message(STATUS "RENHDRUM_SDL_PATCHES: building SDL3 from source instead of the bundled build")
+    set(YUZU_USE_BUNDLED_SDL3 OFF)
+endif()
+
 # ffmpeg
 option(YUZU_USE_BUNDLED_FFMPEG "Download bundled FFmpeg" ${EXT_DEFAULT})
 cmake_dependent_option(YUZU_USE_EXTERNAL_FFMPEG "Build FFmpeg from external source" "${SOLARIS}" "NOT WIN32 AND NOT ANDROID" OFF)
