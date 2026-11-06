@@ -25,6 +25,9 @@ public:
 
     void Process(const Device& device, Frame* frame, VkFormat format, VkExtent2D guest_extent);
 
+    /// Retains resources while invalidating pacing and history across a presentation gap.
+    void Pause();
+
     [[nodiscard]] size_t WantedGenerations(size_t capacity);
 
     [[nodiscard]] size_t GeneratedFrameCount() const;

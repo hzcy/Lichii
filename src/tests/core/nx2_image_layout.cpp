@@ -26,6 +26,40 @@ TEST_CASE("Native color image requirements accept page-aligned storage", "[nx2_i
     REQUIRE(0x1000 + layout.size <= 0x3000000);
 }
 
+TEST_CASE("Native RGB10A2 storage preserves four-byte geometry", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 4;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.width == 3840);
+    REQUIRE(layout.height == 2160);
+    REQUIRE(layout.pitch == 0x3C00);
+    REQUIRE(layout.size == 0x1FE0000);
+    REQUIRE(layout.alignment == 0x2000);
+}
+
+TEST_CASE("Native FP16 storage uses eight-byte geometry", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 5;
+    preference[5] = 480;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.width == 3840);
+    REQUIRE(layout.height == 2160);
+    REQUIRE(layout.pitch == 0x7800);
+    REQUIRE(layout.block_height_log2 == 7);
+    REQUIRE(layout.size == 0x3FC0000);
+    REQUIRE(layout.alignment == 0x2000);
+}
+
+TEST_CASE("Native FP16 rejects a pitch sized for four-byte pixels", "[nx2_image_layout]") {
+    auto preference = ColorPreference;
+    preference[6] = 5;
+    preference[4] = 3;
+    const auto layout = Service::Nx2CalculateImageLayout(preference.data());
+    REQUIRE(layout.pitch == 0x7800);
+    REQUIRE(layout.block_height_log2 == 7);
+    REQUIRE(layout.size == 0x3FC0000);
+}
+
 TEST_CASE("Native image base alignment does not shrink tile geometry", "[nx2_image_layout]") {
     auto preference = ColorPreference;
     preference[4] = 8;

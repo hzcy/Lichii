@@ -265,6 +265,16 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 }
 
+void FrameGen::Pause() {
+    pacer.Reset();
+    plan = {};
+    frame_count = 0;
+    last_count = 0;
+    last_generations = 0;
+    warm_streak = 0;
+    generated = false;
+}
+
 size_t FrameGen::WantedGenerations(size_t capacity) {
     if (unavailable) {
         plan = {};

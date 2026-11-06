@@ -278,6 +278,10 @@ void Fsr3FrameGen::CreatePipelines(const Device& device) {
 
 void Fsr3FrameGen::Process(const Device& device, Scheduler& scheduler, VkImage current_frame,
                            VkImageView current_view, u64 frame_count) {
+    if (frame_count == 0) {
+        m_has_history = false;
+        m_flow_valid = false;
+    }
     if (!m_has_history) {
         // First frame: populate history and current-frame copy via batched dual-copy
         scheduler.Record([this, current_frame](vk::CommandBuffer cmdbuf) {
