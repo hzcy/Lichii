@@ -17,6 +17,18 @@ TEST_CASE("Native pending draws are never discarded", "[video_core][async_draw]"
     }
 }
 
+TEST_CASE("Native pending draws follow the async heuristic when opted in",
+          "[video_core][async_draw]") {
+    REQUIRE(Vulkan::CanDiscardPendingDraw(true, true, 0, 0, true));
+    REQUIRE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 6, 100, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 0, 0, true));
+    // The opt-in never changes non-native draws.
+    REQUIRE(Vulkan::CanDiscardPendingDraw(false, true, 0, 0, true) ==
+            Vulkan::CanDiscardPendingDraw(false, true, 0, 0));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 0, 0, true));
+}
+
 TEST_CASE("Legacy pending draws retain the async heuristic", "[video_core][async_draw]") {
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, true, 0, 0));
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, false, 7, 7));
