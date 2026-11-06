@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <limits>
 #include <cstdio>
@@ -1766,6 +1767,27 @@ void RasterizerVulkan::SignalReference() {
 
 void RasterizerVulkan::ReleaseFences(bool force) {
     fence_manager.WaitPendingFences(force);
+}
+
+void RasterizerVulkan::FlushQueryResults(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0 || !query_cache.SemiFlushRegion(addr, size)) {
+        return;
+    }
+    // Below High GPU accuracy a fence runs its own callback at once, so wait for an operation
+    // queued behind the pending report writes instead. On the split's back the fence's
+    // submission may be deferred, and the fencing thread would wait for this thread to submit it.
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    bool written{};
+    fence_manager.SyncOperation([&] {
+        std::scoped_lock lock{wait_mutex};
+        written = true;
+        wait_cv.notify_all();
+    });
+    fence_manager.SignalFence([] {});
+    scheduler.FlushDeferred();
+    std::unique_lock lock{wait_mutex};
+    wait_cv.wait(lock, [&written] { return written; });
 }
 
 void RasterizerVulkan::FlushAndInvalidateRegion(DAddr addr, u64 size,
