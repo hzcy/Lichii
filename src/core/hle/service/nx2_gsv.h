@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -72,6 +73,7 @@
 #include "core/hle/service/nx2_stub_interface.h"
 #include "core/hle/service/nx2_image_layout.h"
 #include "core/hle/service/nx2_video_input_queue.h"
+#include "core/hle/service/nx2_oot_time.h"
 #include "core/hle/service/nx2_present_pacer.h"
 #include "core/hle/service/nx2_video_ready.h"
 #include "core/hle/service/sm/sm.h"
@@ -1826,6 +1828,12 @@ private:
             }
             m_frame_trace.last_present = entered;
         }
+        if (const auto* const process = system.ApplicationProcess(); process != nullptr) {
+            if (const u64 address = process->GetOotDeltaAddress(); address != 0) {
+                system.ApplicationMemory().Write32(
+                    address, std::bit_cast<u32>(m_oot_frame_delta.Update(entered)));
+            }
+        }
         // Where each frame's time goes on the present thread, averaged per 600 presents: the
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
@@ -1887,6 +1895,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
+    Nx2OotTime::FrameDelta m_oot_frame_delta;
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
