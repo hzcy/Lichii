@@ -24,6 +24,8 @@ struct SysmixOutputCounters {
     u64 ticks{};
     u64 copied_frames{};
     u64 accepted_frames{};
+    u64 retried_frames{};
+    u64 padded_frames{};
     u64 nonzero_frames{};
     u64 admitted_blocks{};
     u64 backpressure{};

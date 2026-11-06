@@ -13,6 +13,7 @@
 #include "audio_core/sink/sink_stream.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/service/audio/errors.h"
@@ -90,6 +91,23 @@ struct SysmixOutput::Impl {
         if (data_mode == 2 && slots - 1 - filled >= static_cast<u32>(threshold)) {
             data_event->Signal(system.Kernel());
         }
+    }
+
+    // emu_us is the guest clock; the wall clock is the timestamp every log line carries.
+    // Comparing their deltas over consecutive windows shows whether emulated time runs at the
+    // host's rate (48000 frames of output per second of wall time).
+    void LogStatus(u32 filled) {
+        const u64 emu_us = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                system.CoreTiming().GetGlobalTimeNs())
+                .count());
+        LOG_INFO(Service_Audio,
+                 "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} "
+                 "queued={} retried={} padded={} filled={} emu_us={}",
+                 id, counters.copied_frames, counters.accepted_frames, counters.nonzero_frames,
+                 counters.admitted_blocks, counters.backpressure,
+                 host ? host->GetQueueSize() : 0, counters.retried_frames, counters.padded_frames,
+                 filled, emu_us);
     }
 
     Core::System& system;
@@ -309,13 +327,20 @@ void SysmixOutput::Pump() {
             return;
         }
         ++p.counters.backpressure;
+        p.counters.retried_frames += taken;
         if (p.counters.backpressure <= 3) {
             LOG_INFO(Service_Audio, "sysmix stream {} host full: accepted={} blocks={}", p.id,
                      p.counters.accepted_frames, p.counters.admitted_blocks);
         }
+        if (p.counters.ticks % 400 == 0) {
+            p.LogStatus(filled);
+        }
         return;
     }
     ++p.counters.admitted_blocks;
+    if (taken < BlockFrames) {
+        p.counters.padded_frames += BlockFrames - taken;
+    }
     const u32 next = (read + taken) % p.slots;
     u32 checked{};
     if (!memory.Read32Acquire(p.buffer + ReadOffset, checked) || checked != read ||
@@ -334,11 +359,7 @@ void SysmixOutput::Pump() {
     p.Notify(filled);
     if (p.counters.admitted_blocks <= 3 || p.counters.ticks % 400 == 0 ||
         (nonzero && p.counters.nonzero_frames == nonzero)) {
-        LOG_INFO(Service_Audio,
-                 "sysmix stream {} output: copied={} accepted={} nonzero={} blocks={} full={} queued={}",
-                 p.id, p.counters.copied_frames, p.counters.accepted_frames,
-                 p.counters.nonzero_frames, p.counters.admitted_blocks, p.counters.backpressure,
-                 p.host->GetQueueSize());
+        p.LogStatus(filled);
     }
 }
 

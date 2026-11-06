@@ -164,11 +164,37 @@ TEST_CASE("sysmix backpressure leaves guest ownership unchanged and resumes in o
     REQUIRE(ReadCursor(context) == 720);
     REQUIRE(stream.GetCounters().accepted_frames == 720);
     REQUIRE(stream.GetCounters().backpressure == 1);
+    REQUIRE(stream.GetCounters().copied_frames == 960);
+    REQUIRE(stream.GetCounters().retried_frames == 240);
     std::array<s16, 480> output{};
     context.sink.last->ProcessAudioOutAndRender(output, 240);
     stream.Pump();
     REQUIRE(ReadCursor(context) == 960);
     REQUIRE(context.sink.last->GetQueueSize() == 3);
+}
+
+TEST_CASE("sysmix pads a short guest block with silence for the host", "[sysmix]") {
+    Context context;
+    Cursor(context, 0, 100);
+    for (u32 i = 0; i < 100; ++i) {
+        Sample(context, i, 0.25f, -0.25f);
+    }
+    SysmixOutput stream{context.system, *context.process, context.sink, 1, Context::Base,
+                        Context::Size, 0x24};
+    REQUIRE(stream.Open(5, 2, 48000, 2048, 0, 0).IsSuccess());
+    REQUIRE(stream.SetEngaged(true).IsSuccess());
+    stream.Pump();
+    REQUIRE(ReadCursor(context) == 100);
+    REQUIRE(stream.GetCounters().accepted_frames == 100);
+    REQUIRE(stream.GetCounters().padded_frames == 140);
+    REQUIRE(stream.GetCounters().admitted_blocks == 1);
+    std::array<s16, 480> output{};
+    context.sink.last->ProcessAudioOutAndRender(output, 240);
+    for (u32 i = 0; i < 200; ++i) {
+        REQUIRE(output[i] == (i % 2 == 0 ? 8192 : -8192));
+    }
+    REQUIRE(std::ranges::all_of(std::span{output}.subspan(200),
+                                [](s16 value) { return value == 0; }));
 }
 
 TEST_CASE("sysmix detects unmapped cursor publication even though exclusive store reports success", "[sysmix]") {
