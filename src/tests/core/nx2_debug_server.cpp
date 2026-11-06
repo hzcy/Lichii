@@ -91,6 +91,52 @@ TEST_CASE("Debug server endpoints are loopback only", "[core][nx2_debug_server]"
     REQUIRE_FALSE(Core::Nx2Debug::ParseEndpoint("12ab", error));
 }
 
+TEST_CASE("Debug frame times measure intervals and retain the ring tail", "[core][nx2_debug_server]") {
+    auto& ring = Core::g_nx2_present_times_ns;
+    SCOPE_EXIT {
+        for (auto& timestamp : ring) {
+            timestamp.store(0);
+        }
+    };
+    const auto read = [](u64 after, u64 end_ns) {
+        return Core::Nx2Debug::ReadFrameTimes(0, after, 1, end_ns, 60.0);
+    };
+    REQUIRE(read(0, 1)["frames"] == 0);
+    ring[1] = 1;
+    REQUIRE(read(1, 1)["mean_ms"] == 0.0);
+    ring[2] = 16'666'668;
+    ring[3] = 50'000'001;
+    const auto mixed = read(3, 50'000'001);
+    REQUIRE(mixed["frames"] == 2);
+    REQUIRE(mixed["mean_ms"] == 25.0);
+    REQUIRE(mixed["p50_ms"] == 25.0);
+    REQUIRE(mixed["fps"] == 40.0);
+    REQUIRE(mixed["vsync_buckets"]["1"] == 0.5);
+    REQUIRE(mixed["vsync_buckets"]["2"] == 0.5);
+    REQUIRE(mixed["intervals_ms"] == json::array({16.7, 33.3}));
+    REQUIRE(mixed["stutters"] == 0);
+    REQUIRE(mixed["truncated"] == false);
+    ring[4] = 150'000'001;
+    REQUIRE(read(4, 150'000'001)["stutters"] == 1);
+    // An overwritten slot must not make an interval across the missing sample.
+    ring[2] = 200'000'001;
+    REQUIRE(read(3, 50'000'001)["frames"] == 0);
+    REQUIRE(read(3, 50'000'001)["truncated"] == true);
+    for (u64 frame = 1; frame <= 5000; ++frame) {
+        ring[frame % ring.size()] = frame * 1'000'000;
+    }
+    const auto overflow = read(5000, 5'000'000'000);
+    REQUIRE(overflow["frames"] == ring.size() - 1);
+    REQUIRE(overflow["mean_ms"] == 1.0);
+    REQUIRE(overflow["truncated"] == true);
+    REQUIRE(overflow["intervals_ms"].size() == 120);
+    // A counted present whose timestamp store is pending still holds the previous lap's value.
+    ring[5000 % ring.size()] = (5000 - ring.size()) * 1'000'000;
+    const auto pending = read(5000, 5'000'000'000);
+    REQUIRE(pending["frames"] == ring.size() - 2);
+    REQUIRE(pending["max_ms"] == 1.0);
+}
+
 TEST_CASE("Debug server requests map to handlers", "[core][nx2_debug_server]") {
     const Handlers handlers = EchoHandlers();
     REQUIRE(json::parse(Core::Nx2Debug::HandleRequest(

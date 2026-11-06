@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <charconv>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <numeric>
 #include <thread>
 
 #include "common/fs/path_util.h"
@@ -205,6 +207,100 @@ json Status(ToolState& state, const json& params) {
         {"rejected", HexList(VideoCore::Nx2Debug::RejectedHashes())},
     };
 }
+
+json FrameTimes(ToolState& state, const json& params) {
+    const double seconds = params.value("seconds", 5.0);
+    const double refresh_hz = params.value("refresh_hz", 60.0);
+    if (!std::isfinite(seconds) || seconds <= 0.0 || seconds > 60.0 ||
+        !std::isfinite(refresh_hz) || refresh_hz <= 0.0) {
+        throw std::runtime_error{"seconds must be > 0 and <= 60; refresh_hz must be > 0"};
+    }
+    const u64 before = g_nx2_present_count.load(std::memory_order_relaxed);
+    const auto begin = std::chrono::steady_clock::now();
+    while (std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count() <
+               seconds &&
+           !state.stopping.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(20ms);
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const u64 after = g_nx2_present_count.load(std::memory_order_relaxed);
+    const u64 begin_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(begin.time_since_epoch()).count();
+    const u64 end_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end.time_since_epoch()).count();
+    return ReadFrameTimes(before, after, begin_ns, end_ns, refresh_hz);
+}
+
+} // Anonymous namespace
+
+json ReadFrameTimes(u64 before, u64 after, u64 begin_ns, u64 end_ns, double refresh_hz) {
+    const u64 capacity = g_nx2_present_times_ns.size();
+    bool truncated = after < before || after - before > capacity;
+    const u64 first = (std::max)(before + 1, after > capacity ? after - capacity + 1 : u64{1});
+    std::vector<double> intervals;
+    u64 previous = 0;
+    for (u64 frame = after; frame >= first; --frame) {
+        const u64 timestamp =
+            g_nx2_present_times_ns[frame % capacity].load(std::memory_order_relaxed);
+        // The counter advances before its store; the slot can also be overwritten during a read.
+        if (timestamp < begin_ns || timestamp > end_ns) {
+            truncated |= timestamp > end_ns;
+            previous = 0;
+            continue;
+        }
+        if (previous != 0 && timestamp > previous) {
+            intervals.clear();
+        } else if (previous != 0) {
+            intervals.push_back(static_cast<double>(previous - timestamp) / 1'000'000.0);
+        }
+        previous = timestamp;
+    }
+
+    std::ranges::reverse(intervals);
+    json recent = json::array();
+    for (size_t i = intervals.size() > 120 ? intervals.size() - 120 : 0; i < intervals.size(); ++i) {
+        recent.push_back(std::round(intervals[i] * 10.0) / 10.0);
+    }
+    std::ranges::sort(intervals);
+    const size_t frames = intervals.size();
+    const auto percentile = [&](double fraction) {
+        if (frames == 0) {
+            return 0.0;
+        }
+        const double index = fraction * static_cast<double>(frames - 1);
+        const size_t low = static_cast<size_t>(index);
+        const size_t high = (std::min)(low + 1, frames - 1);
+        return intervals[low] +
+               (intervals[high] - intervals[low]) * (index - static_cast<double>(low));
+    };
+    const double mean = frames == 0 ? 0.0 : std::accumulate(intervals.begin(), intervals.end(), 0.0) /
+                                              static_cast<double>(frames);
+    const double median = percentile(0.5);
+    std::array<size_t, 4> buckets{};
+    size_t stutters = 0;
+    for (const double interval : intervals) {
+        const double periods = interval * refresh_hz / 1000.0;
+        ++buckets[periods < 1.5 ? 0 : periods < 2.5 ? 1 : periods < 3.5 ? 2 : 3];
+        stutters += interval > 2.0 * median;
+    }
+    const auto share = [&](size_t bucket) {
+        return frames == 0 ? 0.0 : static_cast<double>(buckets[bucket]) / static_cast<double>(frames);
+    };
+    return {{"frames", frames},
+            {"mean_ms", mean},
+            {"fps", mean > 0.0 ? 1000.0 / mean : 0.0},
+            {"p50_ms", median},
+            {"p90_ms", percentile(0.9)},
+            {"p99_ms", percentile(0.99)},
+            {"max_ms", frames == 0 ? 0.0 : intervals.back()},
+            {"min_ms", frames == 0 ? 0.0 : intervals.front()},
+            {"vsync_buckets", {{"1", share(0)}, {"2", share(1)}, {"3", share(2)}, {"4+", share(3)}}},
+            {"stutters", stutters},
+            {"intervals_ms", std::move(recent)},
+            {"truncated", truncated}};
+}
+
+namespace {
 
 json Screenshot(ToolState& state, const json& params) {
     auto& renderer = state.system.GPU().Renderer();
@@ -577,6 +673,7 @@ Handlers MakeHandlers(const std::shared_ptr<ToolState>& state) {
     };
     return {
         {"status", handler(Status)},
+        {"frame_times", handler(FrameTimes)},
         {"screenshot", handler(Screenshot)},
         {"log_tail", handler(LogTail)},
         {"log_filter", handler(LogFilter)},
@@ -818,12 +915,14 @@ Service::Service(System& system, std::string title, u64 program_id, const Endpoi
         VideoCore::Nx2Debug::EndSession();
         throw;
     }
+    g_nx2_present_time_services.fetch_add(1, std::memory_order_relaxed);
     LOG_INFO(Debug, "Debug server listening on {}:{}, dump dir {}", endpoint.host, server->Port(),
              state->dump_directory.generic_string());
 }
 
 Service::~Service() {
     state->stopping.store(true, std::memory_order_relaxed);
+    g_nx2_present_time_services.fetch_sub(1, std::memory_order_relaxed);
     VideoCore::Nx2Debug::EndSession();
     server.reset();
 }

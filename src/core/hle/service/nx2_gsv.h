@@ -1741,7 +1741,14 @@ private:
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
-        Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        const u64 present = Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (Core::g_nx2_present_time_services.load(std::memory_order_relaxed) != 0) {
+            const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            Core::g_nx2_present_times_ns[present % Core::g_nx2_present_times_ns.size()].store(
+                present_ns, std::memory_order_relaxed);
+        }
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);

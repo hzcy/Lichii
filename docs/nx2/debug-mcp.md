@@ -98,8 +98,10 @@ service ends the session first, which wakes every waiter, then stops the `io_con
 shutdown waits at most about 50 ms for a handler.
 
 Cost when unused: if `EDEN_NX2_DEBUG_SERVER` is unset, `MaybeStartService` returns at its first
-`getenv`. No thread, no socket, no log ring. The per-frame check is one relaxed atomic load. The
-runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
+`getenv`. No thread, no socket, no log ring. The per-frame check is one relaxed atomic load,
+and each guest present checks one more relaxed flag: only a running server
+(`g_nx2_present_time_services`, counted by `Service`) makes it store a steady-clock timestamp in the 4096-entry ring
+`frame_times` reads. The runtime reject check in the lowering is one relaxed atomic load per lowered program. When the
 server is on but idle, its thread sleeps in `epoll`/IOCP.
 
 ## Safety
@@ -130,6 +132,7 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 | Tool | Today | With the server | Phase |
 |---|---|---|---|
 | `status` | Ask the owner what is on screen, read the log header | One call: title, program id, build, paused, presents, fps, renderer, rejected hashes | 1 |
+| `frame_times` | Frame trace and manual interval analysis | Guest-present interval statistics and VSync histogram over a timed window | 1 |
 | `screenshot` | Owner takes and sends a screenshot | PNG of the next presented frame, as MCP image content | 1 |
 | `log_tail`, `log_filter` | Relaunch with a new filter, owner sends the log | Read new lines since the last call, change the filter live | 1 |
 | `capture_frame` | Relaunch with `EDEN_NX2_FRAME_DUMP`, owner touches `capture.now`, agent copies the dump | Capture the next frame now, sampled textures and bound buffers optional, get the manifest summary back; `capture_image` returns any pass PNG | 1 |
@@ -150,6 +153,18 @@ server is on but idle, its thread sleeps in `epoll`/IOCP.
 `Common::g_build_fullname` and `g_scm_rev`, and `System::IsPaused`. It measures fps from
 `Core::g_nx2_present_count` (`src/core/core.cpp:78`) over a short window. It does not call
 `GetAndResetPerfStats`, which would reset the Qt status bar's counters.
+
+**`frame_times`** `{seconds?, refresh_hz?}` waits for `seconds` (default 5, > 0, at most 60),
+interruptible on shutdown like `status`. It measures intervals between guest presents inside
+that window, not display scanout or GPU execution time. `frames` counts those intervals;
+`mean_ms`, `fps` (1000 / mean), `p50_ms`, `p90_ms`, `p99_ms`, `min_ms`, `max_ms` describe them.
+Percentiles interpolate between sorted samples. `vsync_buckets` gives fractions (0 to 1) under
+keys `1`, `2`, `3`, `4+`, using boundaries 1.5, 2.5 and 3.5 refresh intervals (`refresh_hz`
+defaults to 60 and must be positive). `stutters` counts intervals strictly above twice the
+median. `intervals_ms` contains the last up to 120 intervals in chronological order, rounded
+to 0.1 ms. With fewer than two presents, statistics are zero and the interval list is empty.
+Only available samples from the 4096-timestamp ring are used; overflow sets `truncated: true`.
+For example: `{"method":"frame_times","params":{"seconds":5,"refresh_hz":60}}`.
 
 **`screenshot`** `{height?, save?, timeout_s?}`. It requests a 16:9 layout from
 `Layout::DefaultFrameLayout`, and the renderer blits the presented framebuffers into it. The

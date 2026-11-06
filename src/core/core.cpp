@@ -78,6 +78,9 @@
 namespace Core {
 
 std::atomic<u64> g_nx2_present_count{};
+static_assert(std::atomic<u64>::is_always_lock_free);
+std::array<std::atomic<u64>, 4096> g_nx2_present_times_ns{};
+std::atomic<u32> g_nx2_present_time_services{};
 
 FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
                                          const std::string& path) {
