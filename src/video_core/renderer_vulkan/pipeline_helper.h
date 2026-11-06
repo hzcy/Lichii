@@ -6,8 +6,15 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstddef>
+#include <cstdlib>
 #include <optional>
+#include <string_view>
+#include <system_error>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
@@ -399,6 +406,50 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
         }
         rescaling.PushImage(is_rescaled);
     }
+}
+
+/// Whether a pipeline using a shader with this hash is built with
+/// VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT. AMD's proprietary compiler crashes or spends
+/// minutes on a few shaders it builds in seconds unoptimized. EDEN_NX2_NOOPT_SHADERS=<hash>,...
+/// adds hashes on any driver ("all" for every pipeline), to look for new ones.
+inline bool BuildsUnoptimized(const Device& device, u64 shader_hash) {
+    // The Legend of Zelda: Ocarina of Time (0400486024DEC000), driver 2.0.353 on an RX 6600 XT
+    static constexpr std::array<u64, 3> amd_proprietary{
+        0x3c2193d0166610b3ULL, // scene lighting fragment shader: access violation at amdvlk64+0xaff2e7
+        0xeff3ccbe1438679dULL, // compute shader built as the AV1 intro starts: 6 min (#200)
+        0xf9ea14a22394f5b1ULL, // compute shader built as the AV1 intro starts: 18 min (#200)
+    };
+    struct Forced {
+        bool all = false;
+        std::vector<u64> hashes;
+    };
+    static const Forced forced = [] {
+        Forced result;
+        const char* const value = std::getenv("EDEN_NX2_NOOPT_SHADERS");
+        const std::string_view text = value != nullptr ? value : "";
+        if (text == "all") {
+            result.all = true;
+            return result;
+        }
+        // Comma-separated hexadecimal hashes, in either case.
+        for (size_t begin = 0; begin < text.size();) {
+            const size_t end = (std::min)(text.find(',', begin), text.size());
+            const std::string_view token = text.substr(begin, end - begin);
+            u64 hash{};
+            const auto [last, error] =
+                std::from_chars(token.data(), token.data() + token.size(), hash, 16);
+            if (!token.empty() && error == std::errc{} && last == token.data() + token.size()) {
+                result.hashes.push_back(hash);
+            }
+            begin = end + 1;
+        }
+        return result;
+    }();
+    if (forced.all || std::ranges::find(forced.hashes, shader_hash) != forced.hashes.end()) {
+        return true;
+    }
+    return device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY &&
+           std::ranges::find(amd_proprietary, shader_hash) != amd_proprietary.end();
 }
 
 } // namespace Vulkan
