@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/renderer_vulkan/pipeline_build.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache_prebuild.h"
 
 namespace {
 using Vulkan::EmissionBudget;
@@ -190,4 +191,193 @@ TEST_CASE("Emission reservations enforce the production fallback and survive bud
     REQUIRE(budget->Pending() == 1);
     budget.reset();
     second.reset();
+}
+
+TEST_CASE("Cached pipeline prebuild bounds captures and ready pipelines before starting work",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+    auto build = [] { return std::make_unique<int>(42); };
+    REQUIRE(cache.Add(1, 60, [&] { return build(); }));
+    REQUIRE_FALSE(cache.Add(1, 0, [&] { return build(); }));
+    REQUIRE_FALSE(cache.Add(2, 41, [&] { return build(); }));
+    REQUIRE(cache.Add(2, 40, [&] { return build(); }));
+    REQUIRE_FALSE(cache.Add(3, 0, [&] { return build(); }));
+    cache.Stop();
+    REQUIRE_FALSE(cache.Add(4, 0, [&] { return build(); }));
+    REQUIRE_FALSE(cache.Take(1));
+}
+
+TEST_CASE("Cached pipeline prebuild adopts a ready pipeline once without queuing duplicates",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    std::atomic<int> builds{};
+    REQUIRE(cache.Add(1, 1, [&] {
+        ++builds;
+        return std::make_unique<int>(42);
+    }));
+    REQUIRE(cache.Add(2, 1, [&] {
+        entered.set_value();
+        gate.wait();
+        return std::make_unique<int>(7);
+    }));
+    cache.Start(1);
+    entered.get_future().wait();
+    auto result = cache.Take(1);
+    const bool duplicate = static_cast<bool>(cache.Take(1));
+    const bool queued = cache.Add(1, 1, [] { return std::make_unique<int>(99); });
+    release.set_value();
+    cache.Stop();
+    REQUIRE(result);
+    REQUIRE(*result == 42);
+    REQUIRE_FALSE(duplicate);
+    REQUIRE_FALSE(queued);
+    REQUIRE(builds == 1);
+}
+
+TEST_CASE("Draws claim pending prebuilds without waiting for a worker or its budget",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    std::atomic<int> builds{};
+    REQUIRE(cache.Add(1, 1, [&] {
+        entered.set_value();
+        gate.wait();
+        ++builds;
+        return std::make_unique<int>(42);
+    }));
+    REQUIRE(cache.Add(2, 1, [&] {
+        ++builds;
+        return std::make_unique<int>(7);
+    }));
+    cache.Start(1);
+    entered.get_future().wait();
+    auto draw = std::async(std::launch::async,
+                           [&] { return !cache.Take(1) && !cache.Take(2) && !cache.Take(3); });
+    const bool immediate = draw.wait_for(std::chrono::seconds{2}) == std::future_status::ready;
+    release.set_value();
+    const bool fallback = draw.get();
+    cache.Stop();
+    REQUIRE(immediate);
+    REQUIRE(fallback);
+    REQUIRE(builds == 1);
+    REQUIRE_FALSE(cache.Take(1));
+}
+
+TEST_CASE("Cached pipeline failures release owned inputs and allow normal draw fallback",
+          "[video_core][pipeline_prebuild]") {
+    for (int failure = 0; failure < 3; ++failure) {
+        Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+        auto input = std::make_shared<int>(42);
+        std::weak_ptr<int> weak = input;
+        std::promise<void> entered, release;
+        auto gate = release.get_future().share();
+        REQUIRE(cache.Add(1, 1, [input = std::move(input), failure]() -> std::unique_ptr<int> {
+            if (failure == 0) {
+                throw std::runtime_error("cached translation failed");
+            }
+            if (failure == 1) {
+                throw 42;
+            }
+            PipelineBuild driver{nullptr,
+                                 [] { throw std::runtime_error("driver compile failed"); }};
+            return driver.Failed() ? nullptr : std::make_unique<int>(42);
+        }));
+        REQUIRE(cache.Add(2, 1, [&] {
+            entered.set_value();
+            gate.wait();
+            return std::make_unique<int>(7);
+        }));
+        cache.Start(1);
+        entered.get_future().wait();
+        const bool released = weak.expired();
+        const bool fallback = !cache.Take(1);
+        release.set_value();
+        cache.Stop();
+        REQUIRE(released);
+        REQUIRE(fallback);
+    }
+}
+
+TEST_CASE("Prebuild cancellation joins active work before destroying external resources",
+          "[video_core][pipeline_prebuild]") {
+    auto resource = std::make_unique<int>(0);
+    auto cache = std::make_unique<Vulkan::PipelinePrebuild<int, int>>(2, 100, false);
+    std::promise<void> entered, release;
+    auto gate = release.get_future().share();
+    REQUIRE(cache->Add(1, 1, [&, output = resource.get()] {
+        entered.set_value();
+        gate.wait();
+        *output = 42;
+        return std::make_unique<int>(7);
+    }));
+    auto queued_input = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = queued_input;
+    REQUIRE(cache->Add(
+        2, 1, [input = std::move(queued_input)] { return std::make_unique<int>(*input); }));
+    cache->Start(1);
+    entered.get_future().wait();
+    auto destroy = std::async(std::launch::async, [&] { cache.reset(); });
+    const bool joined = Pending(destroy);
+    release.set_value();
+    destroy.get();
+    REQUIRE(joined);
+    REQUIRE(*resource == 42);
+    REQUIRE(weak.expired());
+}
+
+TEST_CASE("Broken parallel compilation policy prevents all speculative work",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{64, 16 * 1024 * 1024, true};
+    auto input = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = input;
+    bool built = false;
+    REQUIRE_FALSE(cache.Add(1, 1, [&, input = std::move(input)] {
+        built = true;
+        return std::make_unique<int>(*input);
+    }));
+    cache.Start(2);
+    cache.Stop();
+    REQUIRE_FALSE(built);
+    REQUIRE(weak.expired());
+}
+
+TEST_CASE("Cancelling startup prebuilds releases captures without running them",
+          "[video_core][pipeline_prebuild]") {
+    Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+    auto input = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = input;
+    bool built = false;
+    REQUIRE(cache.Add(1, 1, [&, input = std::move(input)] {
+        built = true;
+        return std::make_unique<int>(*input);
+    }));
+    cache.Stop();
+    cache.Start(2);
+    REQUIRE_FALSE(built);
+    REQUIRE(weak.expired());
+}
+
+TEST_CASE("Concurrent prebuild completion and adoption never return a pipeline twice",
+          "[video_core][pipeline_prebuild]") {
+    for (int iteration = 0; iteration < 32; ++iteration) {
+        Vulkan::PipelinePrebuild<int, int> cache{2, 100, false};
+        REQUIRE(cache.Add(1, 1, [] { return std::make_unique<int>(42); }));
+        REQUIRE(cache.Add(2, 1, [] { return std::make_unique<int>(7); }));
+        cache.Start(2);
+        auto first = std::async(std::launch::async, [&] { return cache.Take(1); });
+        auto second = std::async(std::launch::async, [&] { return cache.Take(1); });
+        const auto a = first.get();
+        const auto b = second.get();
+        cache.Stop();
+        REQUIRE_FALSE((a && b));
+        if (a) {
+            REQUIRE(*a == 42);
+        }
+        if (b) {
+            REQUIRE(*b == 42);
+        }
+    }
 }

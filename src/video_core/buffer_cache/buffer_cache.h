@@ -338,53 +338,91 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
 
 template <class P>
 void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {
-    struct Download {
-        BufferId buffer_id;
-        BufferCopy copy;
+    constexpr bool has_mapped = requires(Buffer& buffer) {
+        buffer.Mapped();
+        buffer.LastUsageTick();
     };
-    boost::container::small_vector<Download, 16> downloads;
-    u64 total_size_bytes = 0;
-    for (const auto& [range_addr, range_size] : ranges) {
-        ForEachBufferInRange(range_addr, range_size, [&](BufferId buffer_id, Buffer& buffer) {
-            const DAddr buffer_addr = buffer.CpuAddr();
-            const DAddr start = (std::max)(range_addr, buffer_addr);
-            const DAddr end = (std::min)(range_addr + range_size, buffer_addr + buffer.SizeBytes());
-            if (start >= end) {
-                return;
+    if constexpr (!USE_MEMORY_MAPS) {
+        for (const auto& [device_addr, size] : ranges) {
+            DownloadMemory(device_addr, size);
+        }
+    } else {
+        struct Download {
+            BufferId buffer_id;
+            BufferCopy copy;
+        };
+        boost::container::small_vector<Download, 16> staged;
+        boost::container::small_vector<Download, 16> mapped;
+        u64 total_size_bytes = 0;
+        u64 mapped_tick = 0;
+        for (const auto& [device_addr, size] : ranges) {
+            ForEachBufferInRange(device_addr, size, [&](BufferId buffer_id, Buffer& buffer) {
+                const DAddr buffer_addr = buffer.CpuAddr();
+                const DAddr begin = (std::max)(device_addr, buffer_addr);
+                const DAddr end = (std::min)(device_addr + size, buffer_addr + buffer.SizeBytes());
+                if (begin >= end) {
+                    return;
+                }
+                bool is_mapped = false;
+                if constexpr (has_mapped) {
+                    is_mapped = !buffer.Mapped().empty();
+                }
+                memory_tracker.ForEachDownloadRangeAndClear(
+                    begin, end - begin, [&](u64 device_addr_out, u64 range_size) {
+                        gpu_modified_ranges.ForEachInRange(
+                            device_addr_out, range_size, [&](DAddr start, DAddr range_end) {
+                                const BufferCopy copy{
+                                    .src_offset = start - buffer_addr,
+                                    .dst_offset = total_size_bytes,
+                                    .size = range_end - start,
+                                };
+                                if (is_mapped) {
+                                    mapped.push_back({buffer_id, copy});
+                                    if constexpr (has_mapped) {
+                                        mapped_tick =
+                                            (std::max)(mapped_tick, buffer.LastUsageTick());
+                                    }
+                                    return;
+                                }
+                                staged.push_back({buffer_id, copy});
+                                total_size_bytes += Common::AlignUp(range_end - start, 64);
+                            });
+                        ClearDownload(device_addr_out, range_size);
+                        gpu_modified_ranges.Subtract(device_addr_out, range_size);
+                    });
+            });
+        }
+        if (staged.empty() && mapped.empty()) {
+            return;
+        }
+        if (staged.empty()) {
+            if constexpr (has_mapped) {
+                runtime.Wait(mapped_tick);
             }
-            memory_tracker.ForEachDownloadRangeAndClear(
-                start, end - start, [&](u64 device_addr_out, u64 out_size) {
-                    gpu_modified_ranges.ForEachInRange(
-                        device_addr_out, out_size, [&](DAddr lower, DAddr upper) {
-                            downloads.push_back({buffer_id, BufferCopy{
-                                                                .src_offset = lower - buffer_addr,
-                                                                .dst_offset = total_size_bytes,
-                                                                .size = upper - lower,
-                                                            }});
-                            total_size_bytes += Common::AlignUp(upper - lower, 64);
-                        });
-                    ClearDownload(device_addr_out, out_size);
-                    gpu_modified_ranges.Subtract(device_addr_out, out_size);
-                });
-        });
-    }
-    if (total_size_bytes == 0) {
-        return;
-    }
-    auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes);
-    for (Download& download : downloads) {
-        download.copy.dst_offset += download_staging.offset;
-        Buffer& buffer = slot_buffers[download.buffer_id];
-        buffer.MarkUsage(download.copy.src_offset, download.copy.size);
-        runtime.CopyBuffer(download_staging.buffer, buffer, std::span{&download.copy, 1}, true);
-    }
-    runtime.Finish();
-    const u8* const mapped_memory = download_staging.mapped_span.data();
-    for (const Download& download : downloads) {
-        const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        device_memory.WriteBlockUnsafe(
-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
-            download.copy.size);
+        } else {
+            auto staging = runtime.DownloadStagingBuffer(total_size_bytes);
+            for (Download& download : staged) {
+                download.copy.dst_offset += staging.offset;
+                Buffer& buffer = slot_buffers[download.buffer_id];
+                buffer.MarkUsage(download.copy.src_offset, download.copy.size);
+                runtime.CopyBuffer(staging.buffer, buffer, std::span{&download.copy, 1}, true);
+            }
+            runtime.Finish();
+            for (const Download& download : staged) {
+                device_memory.WriteBlockUnsafe(
+                    slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
+                    staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
+                    download.copy.size);
+            }
+        }
+        if constexpr (has_mapped) {
+            for (const Download& download : mapped) {
+                Buffer& buffer = slot_buffers[download.buffer_id];
+                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + download.copy.src_offset,
+                                               buffer.Mapped().data() + download.copy.src_offset,
+                                               download.copy.size);
+            }
+        }
     }
 }
 
@@ -2161,6 +2199,35 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
         std::scoped_lock lock{nx2_list_mutex};
         Nx2ListPage& entry = nx2_list_pages[page];
         entry.synced_writes = entry.writes;
+    }
+}
+
+template <class P>
+void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
+    boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges;
+    for (const DAddr page : pages) {
+        ranges.emplace_back(page, page_size);
+    }
+    boost::container::small_vector<std::pair<DAddr, u64>, 16> drawn;
+    if constexpr (!IS_OPENGL) {
+        std::scoped_lock lock{nx2_list_mutex};
+        for (const auto& [page, entry] : nx2_list_pages) {
+            if (entry.draw_written && entry.synced_writes != entry.writes) {
+                ranges.emplace_back(page, page_size);
+                drawn.emplace_back(page, entry.writes);
+            }
+        }
+    }
+    DownloadRangesMemory(ranges);
+    if constexpr (!IS_OPENGL) {
+        std::scoped_lock lock{nx2_list_mutex};
+        for (const auto& [page, writes] : drawn) {
+            const auto it = nx2_list_pages.find(page);
+            if (it != nx2_list_pages.end() && it->second.writes == writes) {
+                it->second.synced_writes = writes;
+            }
+        }
     }
 }
 

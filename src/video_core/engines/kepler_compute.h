@@ -66,6 +66,13 @@ public:
     /// Binds a rasterizer to this engine.
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    [[nodiscard]] bool MayWriteMemory(u32 method) const {
+        if (method >= native_plain_methods.size()) {
+            return true;
+        }
+        return native_mode ? !native_plain_methods[method] : execution_mask[method];
+    }
+
     /// The channel's MME data RAM, shared with its 3D engine.
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {

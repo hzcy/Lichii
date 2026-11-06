@@ -116,6 +116,12 @@ public:
     /// Switch 2: the front flushed this command list page with the split drained.
     virtual void NoteGpuWrittenCommandListSynced([[maybe_unused]] DAddr page) {}
 
+    virtual void FlushGpuWrittenCommandListPages(std::span<const DAddr> pages) {
+        for (const DAddr page : pages) {
+            FlushRegion(page, 0x1000, VideoCommon::CacheType::BufferCache);
+        }
+    }
+
     /// Check if the the specified memory area requires flushing to CPU Memory.
     virtual bool MustFlushRegion(DAddr addr, u64 size,
                                  VideoCommon::CacheType which = VideoCommon::CacheType::All) = 0;

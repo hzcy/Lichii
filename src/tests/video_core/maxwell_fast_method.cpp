@@ -5,8 +5,10 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <random>
+#include <thread>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
@@ -40,6 +42,12 @@ struct GpuSplitTestAccess {
 
     static u64 End(const GpuSplit& split) {
         return split.write_position;
+    }
+
+    static void Start(GpuSplit& split, Core::System& system) {
+        Initialize(split, system);
+        split.active = true;
+        split.back_thread = std::jthread([&split](std::stop_token stop) { split.BackLoop(stop); });
     }
 
     static u64 NearWrap() {
@@ -644,4 +652,129 @@ TEST_CASE("Maxwell3D fast method dispatch cost", "[.][maxwell_fast_method_bench]
     const double run_ns = words(true);
     WARN("Three constant buffer words: " << single_ns << " ns one by one, " << run_ns
                                          << " ns as a run (unmapped buffer)");
+}
+
+TEST_CASE("Full split drains preserve aliased uploads, partial coverage and queued remaps",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    Kernel::KProcess process{f.system.Kernel()};
+    SCOPE_EXIT { f.system.Kernel().UnregisterKernelObject(&process); };
+    auto& table = process.GetPageTable().GetImpl();
+    table.Resize(20, 12);
+    constexpr VAddr cpu_address = 0x4000;
+    constexpr DAddr device_address = 0x10000;
+    constexpr GPUVAddr gpu_address = 0x100000;
+    constexpr GPUVAddr alias = 0x200000;
+    auto* backing = f.physical.GetPointerFromRaw<u8>(0x10000);
+    for (u64 page = 0; page < 2; ++page) {
+        const VAddr address = cpu_address + page * 0x1000;
+        table.entries.GetAndFault(address >> 12)
+            .Store(false, Common::PageType::Memory, 1,
+                   reinterpret_cast<uintptr_t>(backing + page * 0x1000) - address);
+    }
+    process.GetMemory().SetCurrentPageTable(process);
+    const auto asid = f.device_memory.RegisterProcess(&process.GetMemory());
+    f.device_memory.BindInterface(&f.rasterizer);
+    f.device_memory.Map(device_address, cpu_address, 0x2000, asid);
+    SCOPE_EXIT {
+        f.device_memory.Unmap(device_address, 0x2000);
+        f.device_memory.UnregisterProcess(asid);
+    };
+    f.memory.BindRasterizer(&f.rasterizer);
+    f.memory.Map(gpu_address, device_address, 0x2000, Tegra::PTEKind::PITCH, false);
+    f.memory.Map(alias, device_address, 0x1000, Tegra::PTEKind::PITCH, false);
+    std::memset(backing, 0, 0x2000);
+
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    const auto state = [&](u32 method, u32 value) {
+        split.Method(&f.fast, method, value, true, nullptr);
+    };
+    const auto upload = [&](GPUVAddr address, u32 size, std::vector<u32> words) {
+        state(ShadowControl, 0);
+        state(CbAddressHigh, static_cast<u32>(address >> 32));
+        state(CbAddressLow, static_cast<u32>(address));
+        state(CbSize, size);
+        state(CbOffset, 0);
+        split.MultiMethod(&f.fast, CbData, words.data(), static_cast<u32>(words.size()),
+                          static_cast<u32>(words.size()), nullptr);
+        std::ranges::fill(words, 0xdeadbeef);
+    };
+
+    upload(gpu_address, 16, {1, 2, 3, 4});
+    upload(alias + 4, 4, {20, 30});
+    upload(gpu_address + 0x1000, 8, {50, 60});
+    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    std::array<u32, 4> read{};
+    f.memory.ReadBlockUnsafe(gpu_address, read.data(), sizeof(read));
+    REQUIRE(read == std::array<u32, 4>{1, 20, 3, 4});
+    REQUIRE(f.memory.Read<u32>(alias + 4) == 20);
+    REQUIRE(f.memory.Read<u32>(gpu_address + 0x1000) == 50);
+
+    split.Defer([&] {
+        f.memory.Map(alias, device_address + 0x1000, 0x1000, Tegra::PTEKind::PITCH, false);
+    });
+    upload(alias, 4, {70});
+    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    REQUIRE(f.memory.Read<u32>(gpu_address) == 1);
+    REQUIRE(f.memory.Read<u32>(gpu_address + 0x1000) == 70);
+    REQUIRE(f.memory.Read<u32>(alias + 4) == 60);
+}
+
+TEST_CASE("Split consumption does not complete deferred downstream callbacks",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    std::vector<std::function<void()>> deferred;
+    std::array<u32, 3> output{};
+    for (u32 i = 0; i < output.size(); ++i) {
+        split.Defer([&, i] { deferred.emplace_back([&, i] { output[i] = i + 1; }); });
+    }
+    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    REQUIRE(deferred.size() == 3);
+    REQUIRE(output == std::array<u32, 3>{});
+    split.Run([&] {
+        for (auto& operation : deferred) {
+            operation();
+        }
+        deferred.clear();
+    });
+    REQUIRE(output == std::array<u32, 3>{1, 2, 3});
+}
+
+TEST_CASE("Split restart resets writer positions without replaying old releases",
+          "[video_core][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    u32 released{};
+    u32 release_count{};
+    for (u32 session = 1; session <= 3; ++session) {
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        REQUIRE(Access::End(split) == 0);
+        REQUIRE_FALSE(split.WaitForWriters());
+        REQUIRE_FALSE(split.WaitForSync());
+        split.Defer([&, session] {
+            released = session;
+            ++release_count;
+        });
+        split.NoteWriter();
+        split.NoteSync();
+        split.Drain(VideoCommon::DrainSite::Acquire);
+        REQUIRE(released == session);
+        REQUIRE(release_count == session);
+        split.Stop();
+        REQUIRE_FALSE(split.Active());
+        REQUIRE_FALSE(split.BackRunning());
+        REQUIRE(Access::End(split) == 0);
+    }
 }

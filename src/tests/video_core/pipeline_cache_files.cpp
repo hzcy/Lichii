@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -77,6 +78,119 @@ public:
 };
 
 } // Anonymous namespace
+
+TEST_CASE("Task and mesh disk environments roundtrip all translation state and record boundaries",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto path = temp.path / "mesh.bin";
+    constexpr u64 key = 0xabcdef;
+    for (const auto stage : {Shader::Stage::Task, Shader::Stage::Mesh, Shader::Stage::Fragment}) {
+        SerializedEnvironment source{stage};
+        const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+        VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    }
+    size_t read = 0;
+    VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> envs) {
+            const std::array stages{Shader::Stage::Task, Shader::Stage::Mesh,
+                                    Shader::Stage::Fragment};
+            REQUIRE(read < stages.size());
+            REQUIRE(envs.size() == 1);
+            auto& restored = envs.front();
+            SerializedEnvironment source{stages[read++]};
+            REQUIRE(restored.ShaderStage() == source.ShaderStage());
+            REQUIRE(restored.ReadInstruction(0) == 0x123456789abcdef0);
+            REQUIRE(restored.ReadInstruction(8) == 0xfedcba9876543210);
+            REQUIRE(restored.ReadCbufValue(1, 16) == 0x1357);
+            REQUIRE(restored.ReadTextureType(3) == Shader::TextureType::Color2D);
+            REQUIRE(restored.TextureBoundBuffer() == 2);
+            REQUIRE(restored.MemorySize() > sizeof(restored) + 2 * sizeof(u64));
+            if (source.ShaderStage() != Shader::Stage::Fragment) {
+                REQUIRE(restored.MeshRegisters() == source.MeshRegisters());
+                REQUIRE(std::memcmp(&restored.MeshPrimitiveHeader(), &source.MeshPrimitiveHeader(),
+                                    sizeof(Shader::ProgramHeader)) == 0);
+            }
+            u64 restored_key{};
+            file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
+            REQUIRE(restored_key == key);
+        });
+    REQUIRE(read == 3);
+}
+
+TEST_CASE("Compatible v52 pipelines migrate without changing or discarding the old warm cache",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto old = VideoCommon::VersionedPipelineCachePath(temp.path, "vulkan", 52);
+    const auto current = VideoCommon::VersionedPipelineCachePath(
+        temp.path, "vulkan", VideoCommon::VulkanPipelineCacheVersion);
+    SerializedEnvironment source{Shader::Stage::Fragment};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+    constexpr u64 key = 42;
+    VideoCommon::SerializePipeline(key, envs, old, 52);
+    const auto before = ReadAll(old);
+    REQUIRE(VideoCommon::CopyCompatiblePipelineCache(old, current, Magic, 52,
+                                                     VideoCommon::VulkanPipelineCacheVersion));
+    REQUIRE(ReadAll(old) == before);
+    REQUIRE(ReadAll(current).substr(12) == before.substr(12));
+    REQUIRE_FALSE(VideoCommon::CopyCompatiblePipelineCache(
+        old, current, Magic, 52, VideoCommon::VulkanPipelineCacheVersion));
+    bool loaded = false;
+    VideoCommon::LoadPipelines(
+        {}, current, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [&](std::ifstream& file, std::vector<VideoCommon::FileEnvironment> restored) {
+            REQUIRE(restored.size() == 1);
+            REQUIRE(restored.front().ShaderStage() == Shader::Stage::Fragment);
+            u64 restored_key{};
+            file.read(reinterpret_cast<char*>(&restored_key), sizeof(restored_key));
+            REQUIRE(restored_key == key);
+            loaded = true;
+        });
+    REQUIRE(loaded);
+    const auto other = temp.path / "wrong.bin";
+    REQUIRE_FALSE(VideoCommon::CopyCompatiblePipelineCache(old, other, Magic, 51, 53));
+    REQUIRE_FALSE(std::filesystem::exists(other));
+}
+
+TEST_CASE("Truncated mesh state is rejected before a pipeline can be queued",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto path = temp.path / "truncated-mesh.bin";
+    SerializedEnvironment source{Shader::Stage::Mesh};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+    constexpr u64 key = 42;
+    VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    std::filesystem::resize_file(path, std::filesystem::file_size(path) - sizeof(key) - 1);
+    VideoCommon::LoadPipelines(
+        {}, path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {
+            FAIL("Incomplete mesh state reached pipeline creation");
+        });
+    REQUIRE_FALSE(std::filesystem::exists(path));
+}
+
+TEST_CASE("Cancelled mesh loading preserves its disk cache and queues no work",
+          "[pipeline_cache_files][mesh_serialization]") {
+    TempDir temp;
+    const auto path = temp.path / "cancelled-mesh.bin";
+    SerializedEnvironment source{Shader::Stage::Mesh};
+    const std::array<const VideoCommon::GenericEnvironment*, 1> envs{&source};
+    constexpr u64 key = 42;
+    VideoCommon::SerializePipeline(key, envs, path, VideoCommon::VulkanPipelineCacheVersion);
+    const auto before = ReadAll(path);
+    std::stop_source stop;
+    stop.request_stop();
+    VideoCommon::LoadPipelines(
+        stop.get_token(), path, VideoCommon::VulkanPipelineCacheVersion,
+        [](std::ifstream&, VideoCommon::FileEnvironment) { FAIL("Unexpected compute record"); },
+        [](std::ifstream&, std::vector<VideoCommon::FileEnvironment>) {
+            FAIL("Cancelled load reached pipeline creation");
+        });
+    REQUIRE(ReadAll(path) == before);
+}
 
 TEST_CASE("Pipeline cache names are version-suffixed per build", "[pipeline_cache_files]") {
     const std::filesystem::path dir{"shader"};

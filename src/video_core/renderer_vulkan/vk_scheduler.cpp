@@ -191,7 +191,7 @@ s64 FenceFlushIntervalUs() {
         if (value != nullptr) {
             return static_cast<s64>(std::atoll(value));
         }
-        return s64{5000};
+        return s64{500};
     }();
     return interval_us;
 }

@@ -1301,6 +1301,16 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
 }
 
+size_t FileEnvironment::MemorySize() const {
+    const auto map_bytes = [](const auto& map) {
+        return (map.bucket_count() + 1) *
+               (sizeof(typename std::decay_t<decltype(map)>::value_type) + 2);
+    };
+    return sizeof(*this) + code.capacity() * sizeof(u64) + map_bytes(texture_types) +
+           map_bytes(texture_pixel_formats) + map_bytes(cbuf_values) +
+           map_bytes(storage_pointer_types) + map_bytes(cbuf_replacements);
+}
+
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }

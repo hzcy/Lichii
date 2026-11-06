@@ -181,6 +181,10 @@ public:
 
     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
 
+    [[nodiscard]] u64 MapSerial() const {
+        return map_serial.load(std::memory_order_acquire);
+    }
+
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
 

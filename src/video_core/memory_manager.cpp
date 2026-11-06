@@ -19,7 +19,6 @@
 #include "memory_manager.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/guest_memory.h"
-#include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
