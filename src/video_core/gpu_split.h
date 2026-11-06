@@ -13,6 +13,7 @@
 #include <memory>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 
 #include "common/common_types.h"
 
@@ -394,6 +395,8 @@ private:
     }();
     static constexpr u32 MaxPairs = 4096;
 
+    std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
+
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
     static constexpr u32 MaxMultiWords = 8192;
@@ -452,6 +455,18 @@ private:
     // Front side.
     u64 write_position{};
     u64 last_writer_position{};
+    u64 last_memory_writer_position{};
+    static constexpr u32 PendingWriteWords = 8;
+    struct PendingWrite {
+        u64 begin;
+        u64 end;
+        u64 position;
+        u32 words; ///< Known words from begin, or 0 (unknown contents)
+        const char* what;
+        std::array<u32, PendingWriteWords> data;
+    };
+    std::array<PendingWrite, 8192> pending_writes{};
+    u64 pending_write_count{};
     u64 last_sync_position{};
     u64 last_release_position{};
     std::array<u64, 64> sem_write_positions{};

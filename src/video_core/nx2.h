@@ -29,6 +29,9 @@ inline std::atomic<bool> g_nx2_ampere{false};
 inline constexpr u64 Nx2WrittenPageBits = 12;
 inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
 
+/// Bumped when a page is marked GPU-written for the first time (EDEN_NX2_LIST_FAST).
+inline std::atomic<u64> g_nx2_new_written_pages{};
+
 inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
     if (size == 0) {
         return;
@@ -77,6 +80,28 @@ inline void Nx2MarkCommandListPage(u64 device_address) {
 }
 
 /// A new emulation session starts: no page has been written by its GPU yet.
+// Query results written when their host work completes (counter reports): per 16-byte slot
+// hash, how many the back issued and how many completed. Equal counts mean the words in memory
+// are final, so the split's front can read them without draining the back.
+inline constexpr u64 Nx2AsyncReportSlots = u64{1} << 16;
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_issued{};
+inline std::array<std::atomic<u32>, Nx2AsyncReportSlots> g_nx2_async_reports_completed{};
+
+[[nodiscard]] inline u64 Nx2AsyncReportSlot(u64 device_address) {
+    return (device_address >> 4) % Nx2AsyncReportSlots;
+}
+
+[[nodiscard]] inline bool Nx2AsyncReportsSettled(u64 device_address, u64 size) {
+    for (u64 slot = device_address >> 4; slot <= (device_address + size - 1) >> 4; ++slot) {
+        const u64 index = slot % Nx2AsyncReportSlots;
+        if (g_nx2_async_reports_completed[index].load(std::memory_order_acquire) !=
+            g_nx2_async_reports_issued[index].load(std::memory_order_acquire)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline void Nx2ClearGpuWrittenPages() {
     for (auto& word : g_nx2_gpu_written_pages) {
         word.store(0, std::memory_order_relaxed);

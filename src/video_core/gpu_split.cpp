@@ -149,6 +149,9 @@ void GpuSplit::Stop() {
     ring.reset();
     write_position = 0;
     last_writer_position = 0;
+    last_memory_writer_position = 0;
+    pending_write_count = 0;
+    async_writes.clear();
     last_sync_position = 0;
     last_release_position = 0;
     sem_write_positions.fill(0);
@@ -250,6 +253,104 @@ void GpuSplit::Drain(DrainSite site) {
 
 bool GpuSplit::WaitForWriters(DrainSite site) {
     return WaitFor(std::min(last_writer_position, write_position), site);
+}
+
+bool GpuSplit::WaitForMemoryWriters() {
+    const u64 target = (std::max)(last_writer_position, last_memory_writer_position);
+    return WaitFor((std::min)(target, write_position), DrainSite::MacroDmaRead);
+}
+
+bool GpuSplit::WaitForWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    u64 target = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            target = (std::max)(target, write.position);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        return false;
+    }
+    if (target != 0) {
+        WaitFor(target, DrainSite::MacroDmaRead);
+    }
+    return true;
+}
+
+bool GpuSplit::HasQueuedWritesTo(u64 begin, u64 size) {
+    consumed_cache = consumed.load(std::memory_order_acquire);
+    const u64 end = begin + size;
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    for (u64 scanned = 0; scanned < remembered; ++scanned) {
+        const PendingWrite& write =
+            pending_writes[(pending_write_count - 1 - scanned) % pending_writes.size()];
+        if (write.position <= consumed_cache) {
+            return false;
+        }
+        if (write.begin < end && begin < write.end) {
+            return true;
+        }
+    }
+    return remembered == pending_writes.size();
+}
+
+bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
+    if ((begin & 3) != 0) {
+        return false;
+    }
+    const u64 end = begin + u64{words} * sizeof(u32);
+    const u64 remembered = (std::min<u64>)(pending_write_count, pending_writes.size());
+    // Newest first, back to what the back had consumed before guest memory was read.
+    std::array<u32, 64> overlapping;
+    u32 found = 0;
+    u64 scanned = 0;
+    for (; scanned < remembered; ++scanned) {
+        const u64 index = (pending_write_count - 1 - scanned) % pending_writes.size();
+        const PendingWrite& write = pending_writes[index];
+        if (write.position <= since) {
+            break;
+        }
+        if (write.begin < end && begin < write.end) {
+            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
+                // EDEN_NX2_OVERLAY_TRACE: which queued writes keep reads waiting.
+                static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+                static std::atomic<u32> traced{};
+                if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 48) {
+                    LOG_INFO(HW_GPU, "overlay: read {:#x}+{} blocked by {} write {:#x}-{:#x}",
+                             begin, words * 4, write.what, write.begin, write.end);
+                }
+                return false;
+            }
+            overlapping[found++] = static_cast<u32>(index);
+        }
+    }
+    if (scanned == pending_writes.size()) {
+        static const bool trace = std::getenv("EDEN_NX2_OVERLAY_TRACE") != nullptr;
+        static std::atomic<u32> traced{};
+        if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(HW_GPU, "overlay: read {:#x} with over {} queued writes", begin,
+                     pending_writes.size());
+        }
+        return false;
+    }
+    for (u32 i = found; i-- > 0;) {
+        const PendingWrite& write = pending_writes[overlapping[i]];
+        for (u32 w = 0; w < write.words; ++w) {
+            const u64 address = write.begin + u64{w} * sizeof(u32);
+            if (address >= begin && address < end) {
+                out[(address - begin) / sizeof(u32)] = write.data[w];
+            }
+        }
+    }
+    return true;
 }
 
 bool GpuSplit::WaitForSync() {

@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <optional>
@@ -211,6 +212,10 @@ public:
     void RecordParsedEntry(const CommandListHeader& header, std::span<const CommandHeader> commands);
     /// Whether the entry lies on device pages the GPU has written (NX2).
     bool IsGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// EDEN_NX2_LIST_FAST: whether an entry of `size` bytes skips the wait for queued writers.
+    bool SkipWriterWait(u64 size);
+    u64 list_fast_marks{};
+    std::chrono::steady_clock::time_point list_fast_since{};
     /// Copies the list's words from memory again, as of suspension count `now`.
     void RefreshSnapshot(CommandList& list, u64 now);
     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.

@@ -17,7 +17,9 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2_profile.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/host1x/host1x.h"
@@ -227,6 +229,39 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
 
 void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
     rasterizer = rasterizer_;
+}
+
+void MemoryManager::BumpMapSerial(GPUVAddr begin, size_t size) {
+    const u64 next = map_serial.load(std::memory_order_relaxed) + 1;
+    MapChange& change = map_changes[next % MapChangeCount];
+    change.serial.store(0, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    change.begin.store(begin, std::memory_order_relaxed);
+    change.end.store(begin + size, std::memory_order_relaxed);
+    change.serial.store(next, std::memory_order_release);
+    map_serial.store(next, std::memory_order_release);
+}
+
+bool MemoryManager::UnchangedSince(u64 since, u64 now, GPUVAddr begin, GPUVAddr end) const {
+    if (now < since || now - since > MapChangeCount / 2) {
+        return false;
+    }
+    for (u64 serial = since + 1; serial <= now; ++serial) {
+        const MapChange& change = map_changes[serial % MapChangeCount];
+        if (change.serial.load(std::memory_order_acquire) != serial) {
+            return false;
+        }
+        const GPUVAddr change_begin = change.begin.load(std::memory_order_relaxed);
+        const GPUVAddr change_end = change.end.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (change.serial.load(std::memory_order_relaxed) != serial) {
+            return false;
+        }
+        if (change_begin < end && begin < change_end) {
+            return false;
+        }
+    }
+    return true;
 }
 
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {

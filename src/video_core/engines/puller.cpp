@@ -11,6 +11,8 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include <optional>
+
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
@@ -22,6 +24,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
@@ -274,6 +277,8 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
     }
 }
 
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word);
+
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
@@ -429,6 +434,12 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    if (VideoCore::Nx2Debug::g_sem_fast.load(std::memory_order_relaxed) != 0 &&
+        VideoCommon::GpuSplit::Get().Active()) {
+        // Only the warning below reads the result: release the fences in order instead.
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        return;
+    }
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
@@ -445,6 +456,57 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                         operation, address, word, payload);
         }
     }
+}
+
+// A semaphore release queued for the split's back: the front's macro DMA reads of those bytes
+// wait for it (EDEN_NX2_DMA_WAIT_WRITERS).
+// A fence release (`fence_payload`) is written when the back runs it, so reads overlay it.
+static void NoteSemaphoreWrite(DmaPusher& dma_pusher, GPUVAddr address,
+                               std::optional<u32> fence_payload) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    split.NoteMemoryWriter();
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return; // Queries write nothing at an unmapped address.
+    } else if (fence_payload) {
+        split.NoteMemoryWriteData(*device, &*fence_payload, 1);
+    } else {
+        // Written when its fence is signalled: reads wait until the back ran it and it was.
+        split.NoteAsyncWrite(*device, 16);
+        split.NoteMemoryWrite(*device, 16, "semaphore (timed)");
+    }
+}
+
+// EDEN_NX2_SEM_FAST: whether the word at `address` can be read without draining the back: not
+// GPU-written, after waiting only for the queued writes noted to it.
+// =2 also overlays the queued fence releases the front knows, instead of waiting for them.
+static bool SemaphoreReadableNow(DmaPusher& dma_pusher, GPUVAddr address, u32& word) {
+    auto& split = VideoCommon::GpuSplit::Get();
+    const int mode = VideoCore::Nx2Debug::g_sem_fast.load(std::memory_order_relaxed);
+    if (!split.Active() || mode == 0) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2IsGpuWritten(*device)) {
+        return false;
+    }
+    if (const u64 async_position = split.HasAsyncWrite(*device, 4);
+        async_position != 0 &&
+        (async_position > split.ConsumedNow() || !Nx2AsyncReportsSettled(*device, 4))) {
+        return false;
+    }
+    if (mode >= 2) {
+        const u64 since = split.ConsumedNow();
+        word = dma_pusher.memory_manager.Read<u32>(address);
+        if (split.OverlayQueuedWrites(since, *device, &word, 1)) {
+            return true;
+        }
+    }
+    if (!split.WaitForWritesTo(*device, 16)) {
+        return false;
+    }
+    word = dma_pusher.memory_manager.Read<u32>(address);
+    return true;
 }
 
 /// Calls a GPU puller method.
@@ -474,6 +536,7 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     case BufferMethods::SyncpointOperation:
         ProcessFenceActionMethod(dma_pusher);
+        VideoCommon::GpuSplit::Get().NoteMemoryWriter();
         break;
     case BufferMethods::WaitForIdle:
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
@@ -482,6 +545,12 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
         break;
     case BufferMethods::SemaphoreOperation: {
         ProcessSemaphoreTriggerMethod(dma_pusher);
+        if (static_cast<GpuSemaphoreOperation>(regs.semaphore_trigger & 0xF) ==
+            GpuSemaphoreOperation::WriteLong) {
+            const bool fence = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0;
+            NoteSemaphoreWrite(dma_pusher, regs.semaphore_address.SemaphoreAddress(),
+                               fence ? std::optional<u32>{regs.semaphore_sequence} : std::nullopt);
+        }
         break;
     }
     case BufferMethods::NonStallInterrupt: {
@@ -514,6 +583,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
             ProcessSemaphoreExecute(dma_pusher, method_call.argument);
         } else {
             ProcessSemaphoreRelease(dma_pusher);
+        }
+        if (g_nx2_ampere && (method_call.argument & 7) == 1) {
+            NoteSemaphoreWrite(dma_pusher,
+                               (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
+                                   (regs.reg_array[0x17] & ~3U),
+                               regs.reg_array[0x19]);
+        } else if (!g_nx2_ampere) {
+            NoteSemaphoreWrite(dma_pusher, regs.semaphore_address.SemaphoreAddress(),
+                               std::nullopt);
         }
         break;
     }
