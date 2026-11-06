@@ -62,6 +62,45 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// EDEN_NX2_ACQUIRE_PRECHECK=1: a GEQUAL acquire whose word already holds the value continues
+// without draining the split, if no GPU work ever wrote the word's page (then no cache holds a
+// newer word than guest memory). It counts as a host sync for later GPU-written command lists,
+// as the drain did. Equal and mask acquires always drain.
+bool GequalMetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, u32 value) {
+    static const bool enabled = [] {
+        const char* setting = std::getenv("EDEN_NX2_ACQUIRE_PRECHECK");
+        return setting != nullptr && setting[0] != '0';
+    }();
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!enabled || !split.Active()) {
+        return false;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device || Nx2IsGpuWritten(*device) ||
+        dma_pusher.memory_manager.Read<u32>(address) < value) {
+        return false;
+    }
+    split.NoteSync();
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquiresFast, 1);
+    return true;
+}
+
+// EDEN_NX2_DMA_READ_FAST (GpuSplit::TracksMemoryWrites): a release just sent to the back writes
+// up to 16 bytes at `address`.
+void NoteRelease(DmaPusher& dma_pusher, GPUVAddr address) {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.TracksMemoryWrites()) {
+        split.NoteMemoryWrite(&dma_pusher.memory_manager, address, 16);
+    }
+}
+
+// Work just sent to the back may write guest memory anywhere (fence operations: query and
+// semaphore results; waits for idle: query results).
+void NoteMemoryWriter() {
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.TracksMemoryWrites()) {
+        split.NoteMemoryWriter();
+    }
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -222,6 +261,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         VideoCommon::GpuSplit::Get().NoteSync();
+        NoteMemoryWriter();
         break;
     case Puller::FenceOperation::Increment:
         OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
@@ -438,6 +478,7 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     case BufferMethods::WaitForIdle:
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
         VideoCommon::GpuSplit::Get().NoteSync();
+        NoteMemoryWriter();
         break;
     case BufferMethods::SemaphoreOperation: {
         ProcessSemaphoreTriggerMethod(dma_pusher);

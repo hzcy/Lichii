@@ -179,12 +179,13 @@ u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
     return signal_value;
 }
 
-bool Scheduler::DeferFlush() {
-    // Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
-    // Imprisonment fights, each a queue submission (~22,000 a second with the others), which
-    // kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
-    // Command list copies after dispatches were ~9,000 more a second, of which the front waited
-    // for about 5%.
+namespace {
+// Fences come one per compute release: ~11,500 a second in Hyrule Warriors: Age of
+// Imprisonment fights, each a queue submission (~22,000 a second with the others), which
+// kept the Vulkan worker busy submitting. Batched within 500 us: ~10-15% more fps there.
+// Command list copies after dispatches were ~9,000 more a second, of which the front waited
+// for about 5%.
+s64 FenceFlushIntervalUs() {
     static const s64 interval_us = [] {
         const char* value = std::getenv("EDEN_NX2_FENCE_FLUSH_US");
         if (value != nullptr) {
@@ -192,8 +193,32 @@ bool Scheduler::DeferFlush() {
         }
         return s64{5000};
     }();
-    if (interval_us <= 0 || !VideoCommon::GpuSplit::OnBackThread() ||
-        std::chrono::steady_clock::now() - last_flush >= std::chrono::microseconds{interval_us}) {
+    return interval_us;
+}
+} // Anonymous namespace
+
+bool Scheduler::InFlushWindow() const {
+    const s64 interval_us = FenceFlushIntervalUs();
+    return interval_us > 0 && VideoCommon::GpuSplit::OnBackThread() &&
+           std::chrono::steady_clock::now() - last_flush < std::chrono::microseconds{interval_us};
+}
+
+bool Scheduler::DeferFlush() {
+    if (!InFlushWindow()) {
+        return false;
+    }
+    flush_pending = true;
+    return true;
+}
+
+bool Scheduler::InFlushWindow(std::chrono::steady_clock::time_point now) const {
+    const s64 interval_us = FenceFlushIntervalUs();
+    return interval_us > 0 && VideoCommon::GpuSplit::OnBackThread() &&
+           now - last_flush < std::chrono::microseconds{interval_us};
+}
+
+bool Scheduler::DeferFlush(std::chrono::steady_clock::time_point now) {
+    if (!InFlushWindow(now)) {
         return false;
     }
     flush_pending = true;
@@ -222,9 +247,17 @@ bool Scheduler::WaitSubmitted(u64 tick) {
         }
         if (const auto now = std::chrono::steady_clock::now(); now >= next_log) {
             next_log = now + std::chrono::seconds{2};
-            LOG_WARNING(Render_Vulkan, "Waited {} s for the GPU thread to submit tick {}",
+            // The back serves the request between entries: one that never does is blocked in
+            // an entry. Name the wait when it is a tracked one (BackWaitScope).
+            const char* const back_site = VideoCommon::back_wait_site.load(std::memory_order_relaxed);
+            LOG_WARNING(Render_Vulkan,
+                        "Waited {} s for the GPU thread to submit tick {} (submitted up to {}); "
+                        "GPU back thread blocked in: {}",
                         std::chrono::duration_cast<std::chrono::seconds>(now - start).count(),
-                        tick);
+                        tick, master_semaphore->CurrentTick() - 1,
+                        back_site != nullptr ? back_site
+                                             : "no tracked wait (an untracked lock or wait, or "
+                                               "a long entry)");
             split.RequestIdleHook();
         }
         if (spins < 64) {

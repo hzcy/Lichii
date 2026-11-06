@@ -25,6 +25,7 @@
 #include "common/polyfill_thread.h"
 #include "common/settings.h"
 #include "video_core/gpu_split.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -64,6 +65,12 @@ public:
     /// once); otherwise it goes with the next one. The back submits deferred work before it
     /// sleeps and when another thread asks (WaitSubmitted). True when the flush was deferred.
     bool DeferFlush();
+    /// DeferFlush with the caller's clock reading (EDEN_NX2_FENCE_LIGHT).
+    bool DeferFlush(std::chrono::steady_clock::time_point now);
+    /// Whether DeferFlush would defer a flush made now (no side effect).
+    [[nodiscard]] bool InFlushWindow() const;
+    /// InFlushWindow with the caller's clock reading (EDEN_NX2_FENCE_LIGHT).
+    [[nodiscard]] bool InFlushWindow(std::chrono::steady_clock::time_point now) const;
     /// Submits deferred work (the split's back, from its idle hook).
     void FlushDeferred();
     /// Threads other than the split's back: waits until tick is submitted, asking the back to
@@ -236,6 +243,7 @@ public:
             if (tick >= master_semaphore->CurrentTick()) {
                 Flush();
             }
+            VideoCommon::BackWaitScope wait_scope{"Scheduler::Wait (host GPU execution)"};
             master_semaphore->Wait(tick);
         }
         const auto trace_waited = trace ? std::chrono::steady_clock::now()

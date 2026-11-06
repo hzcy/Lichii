@@ -271,6 +271,9 @@ private:
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+    bool FrontPlainWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
+                         u32 argument);
+    void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     std::unique_ptr<FrontState> front;
     bool front_macros{}; ///< The front owns the macro code and bindings (the back skips them)
 
@@ -344,6 +347,7 @@ private:
     void ProcessLaunch();
 
     void ConsumeSinkImpl(Core::System& system) override;
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.
     Texture::TICEntry GetTICEntry(u32 tic_index) const;

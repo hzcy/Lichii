@@ -1430,7 +1430,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
                         for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
                             if (const auto device = memory.GpuToCpuAddress(page)) {
-                                VideoCommon::Nx2Profile::DmaReadPages().insert(*device >> 12);
+                                VideoCommon::Nx2Profile::AddDmaReadPage(*device >> 12);
                             }
                         }
                     }

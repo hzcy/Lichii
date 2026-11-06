@@ -14,6 +14,10 @@
 
 #include <fmt/format.h>
 #include <openssl/evp.h>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <limits>
 #include <zstd.h>
 
 #include "common/fs/path_util.h"
@@ -321,8 +325,19 @@ private:
             return {};
         }
         std::vector<u8> out(static_cast<std::size_t>(uncompressed_size));
+        const auto zstd_begin = std::chrono::steady_clock::now();
         const std::size_t result =
             ZSTD_decompress(out.data(), out.size(), compressed.data(), compressed.size());
+        {
+            // sergio: count re-decompressions to see what the cache size buys.
+            static std::atomic<u32> logged{};
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - zstd_begin).count();
+            if (ms > 2.0 && logged.fetch_add(1) < 400) {
+                LOG_INFO(Loader, "NUP decompressed {} ({:.1f} MiB) in {:.1f} ms", name,
+                         static_cast<double>(out.size()) / (1024.0 * 1024.0), ms);
+            }
+        }
         if (ZSTD_isError(result) || result != out.size()) {
             LOG_ERROR(Loader, "NUP zstd decompression failed for {}", name);
             return {};
@@ -363,6 +378,18 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
                            std::filesystem::path spill_dir_)
     : file(std::move(file_)), cache(std::make_shared<NupDecompressCache>()) {
     cache->cap = memory_cache_cap;
+    // EDEN_NUP_CACHE_MIB raises the decompression cache above the 512 MiB default on hosts with
+    // RAM to spare (6144 on a 40 GB desktop); unset keeps the default. Opt-in only (review of #166).
+    if (memory_cache_cap == NupDecompressCache::DefaultCap) {
+        if (const char* v = std::getenv("EDEN_NUP_CACHE_MIB"); v != nullptr && v[0] != 0) {
+            constexpr std::size_t MiB = 1024 * 1024;
+            const auto mib = static_cast<std::size_t>(std::strtoull(v, nullptr, 10));
+            if (mib >= 64 && mib <= std::numeric_limits<std::size_t>::max() / MiB) {
+                cache->cap = mib * MiB;
+            }
+        }
+        LOG_INFO(Loader, "NUP decompression cache: {} MiB", cache->cap / (1024 * 1024));
+    }
     cache->spill_dir = spill_dir_.empty()
                            ? Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) / "nup"
                            : std::move(spill_dir_);

@@ -281,9 +281,21 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler), wfi_event(device.GetLogical().CreateEvent()) {
     scheduler.SetQueryCache(query_cache);
-    VideoCommon::GpuSplit::Get().SetIdleHook(
-        [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
-        &scheduler);
+    if (FenceManager::CoalesceDownloads()) {
+        // EDEN_NX2_DOWNLOAD_COALESCE: buffer downloads fences left for later go with this
+        // submission, not with whatever comes after the back wakes up.
+        VideoCommon::GpuSplit::Get().SetIdleHook(
+            [](void* argument) {
+                auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
+                rasterizer->fence_manager.CommitCoalescedDownloads();
+                rasterizer->scheduler.FlushDeferred();
+            },
+            this);
+    } else {
+        VideoCommon::GpuSplit::Get().SetIdleHook(
+            [](void* argument) { static_cast<Scheduler*>(argument)->FlushDeferred(); },
+            &scheduler);
+    }
 }
 
 RasterizerVulkan::~RasterizerVulkan() {

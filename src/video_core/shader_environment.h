@@ -45,6 +45,39 @@ struct LoweredNativeCode {
     u32 texture_bound = ~0U;
 };
 
+/// EDEN_NX2_PIPELINE_ASYNC: what translating a graphics pipeline's programs reads from the 3D
+/// engine and from guest memory besides the program code, copied on the GPU thread when the build
+/// is queued. The translation then runs on a worker without touching Maxwell3D or the memory
+/// manager, which the GPU thread keeps changing. A read the copy cannot answer marks the
+/// environment (AsyncSnapshotMissed) and the pipeline is built again on the GPU thread.
+struct AsyncGraphicsSnapshot {
+    struct ConstBuffer {
+        bool enabled{};
+        u32 size{}; ///< As bound: reads at or past it return 0, as on the GPU thread
+        /// Bytes from the buffer's start: min(size, MaxConstBufferSize) rounded up to 8, plus 8
+        /// (a u32 read starting just below size reads past it).
+        std::vector<u8> bytes;
+        /// Per 8-byte slot: the u64 there (as ReadCbufValue returns it) is a mapped GPU address.
+        std::vector<bool> pointer_mapped;
+    };
+    struct Stage {
+        std::array<ConstBuffer, Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers> const_buffers;
+    };
+    std::array<Stage, Tegra::Engines::Maxwell3D::Regs::MaxShaderStage> stages;
+    /// The first entries of the texture header pool (all of it up to MaxTicBytes).
+    std::vector<Tegra::Texture::TICEntry> tic;
+    u32 tic_limit{};
+    bool via_header_index{};
+    bool native_tiling{};
+    u32 viewport_transform_state{};
+    ::Common::unordered_map<u64, Tegra::Engines::Maxwell3D::HLEReplacementAttributeType>
+        replace_table;
+    size_t bytes{}; ///< Copied, for the statistics
+
+    /// A larger header pool is copied up to here; a handle past it fails the build.
+    static constexpr size_t MaxTicBytes = 4ULL << 20;
+};
+
 class GenericEnvironment : public Shader::Environment {
 public:
     explicit GenericEnvironment() = default;
@@ -91,6 +124,12 @@ public:
     }
 
     [[nodiscard]] bool CanBeSerialized() const noexcept;
+
+    /// EDEN_NX2_PIPELINE_ASYNC: a read during the translation on a worker that the snapshot
+    /// could not answer; the result must be discarded.
+    [[nodiscard]] bool AsyncSnapshotMissed() const noexcept {
+        return async_missed;
+    }
 
     [[nodiscard]] u64 CalculateHash() const;
 
@@ -146,6 +185,13 @@ protected:
 
     bool has_unbound_instructions = false;
     bool has_hle_engine_state = false;
+
+    /// EDEN_NX2_PIPELINE_ASYNC: set while the program is translated off the GPU thread. Reads
+    /// are then answered from the snapshot only; one it cannot answer sets async_missed.
+    [[nodiscard]] bool AsyncPointerMapped(u32 index, u32 offset, u64 address);
+    std::shared_ptr<const AsyncGraphicsSnapshot> async_snapshot;
+    const AsyncGraphicsSnapshot::Stage* async_stage{};
+    bool async_missed = false;
 };
 
 class GraphicsEnvironment final : public GenericEnvironment {
@@ -171,7 +217,15 @@ public:
 
     std::optional<Shader::ReplaceConstant> GetReplaceConstBuffer(u32 bank, u32 offset) override;
 
+    /// EDEN_NX2_PIPELINE_ASYNC: copies, on the GPU thread, what translating these environments'
+    /// programs reads besides their code (which SetCachedSize already holds), and makes them read
+    /// only the copy from then on. The environments must come from the same engine state.
+    static std::shared_ptr<const AsyncGraphicsSnapshot> SnapshotForAsync(
+        std::span<GraphicsEnvironment* const> envs);
+
 private:
+    [[nodiscard]] Tegra::Texture::TICEntry ReadAsyncTextureInfo(u32 handle);
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
 };

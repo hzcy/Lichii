@@ -7,6 +7,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <memory>
 #include <numeric>
 #include <cstdlib>
 #include <limits>
@@ -42,6 +46,77 @@ namespace VideoCommon {
 [[nodiscard]] inline bool NativeDrawDiagnostics() {
     static const bool enabled = std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") != nullptr;
     return enabled;
+}
+
+/// EDEN_NX2_TEX_UPLOAD_ASYNC=1 (default off): the CPU part of the image uploads a draw's or a
+/// dispatch's FillImageViews causes (unswizzle, convert or copy into staging) runs on a worker
+/// pool, the copies are recorded when FillImageViews returns. EDEN_NX2_TEX_UPLOAD_THREADS
+/// workers (default 2); EDEN_NX2_TEX_UPLOAD_MIN_KIB (default 64): smaller uploads stay synchronous.
+[[nodiscard]] inline bool AsyncTextureUploadEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TEX_UPLOAD_ASYNC");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+[[nodiscard]] inline size_t AsyncTextureUploadThreads() {
+    static const size_t threads = [] {
+        const char* value = std::getenv("EDEN_NX2_TEX_UPLOAD_THREADS");
+        const unsigned long long count = value != nullptr ? std::strtoull(value, nullptr, 10) : 2;
+        return static_cast<size_t>(std::clamp<unsigned long long>(count, 1, 16));
+    }();
+    return threads;
+}
+
+[[nodiscard]] inline u64 AsyncTextureUploadMinBytes() {
+    static const u64 bytes = [] {
+        const char* value = std::getenv("EDEN_NX2_TEX_UPLOAD_MIN_KIB");
+        return u64{value != nullptr ? std::strtoull(value, nullptr, 10) : 64} << 10;
+    }();
+    return bytes;
+}
+
+/// Takes a queued upload job for the calling thread; false when another thread has it.
+[[nodiscard]] inline bool ClaimAsyncUploadJob(AsyncUploadJob& job) noexcept {
+    u32 expected = AsyncUploadJob::Queued;
+    return job.state.compare_exchange_strong(expected, AsyncUploadJob::Running,
+                                             std::memory_order_acq_rel);
+}
+
+/// Publishes a claimed job as Done (its outputs visible to whoever sees Done).
+inline void FinishAsyncUploadJob(AsyncUploadJob& job) noexcept {
+    job.state.store(AsyncUploadJob::Done, std::memory_order_release);
+    job.state.notify_all();
+}
+
+/// Runs a claimed job: what UploadImageContents does between reading guest memory and recording
+/// the copy, from the job's inputs only. An exception marks it failed.
+inline void RunAsyncUploadJob(AsyncUploadJob& job) noexcept {
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        const std::span<const u8> input{
+            job.source != nullptr ? job.source : job.source_copy.data(), job.source_size};
+        if (job.accelerated) {
+            std::memcpy(job.staging.data(), input.data(),
+                        (std::min)(input.size(), job.staging.size()));
+        } else if (job.converted) {
+            thread_local Common::ScratchBuffer<u8> unswizzled;
+            unswizzled.resize_destructive(job.unswizzled_size);
+            job.copies = UnswizzleImageData(job.native_tiling, job.info, input, unswizzled);
+            ConvertImage(unswizzled, job.info, job.staging, job.copies);
+            if (unswizzled.capacity() > 64_MiB) {
+                unswizzled.release();
+            }
+        } else {
+            job.copies = UnswizzleImageData(job.native_tiling, job.info, input, job.staging);
+        }
+    } catch (...) {
+        job.failed = true;
+    }
+    job.busy_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count());
 }
 
 using Tegra::Texture::TICEntry;
@@ -127,6 +202,13 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
         gpu_unswizzle_maxsize = 0;
         swizzle_chunk_size = 0;
         swizzle_slices_per_batch = 0;
+    }
+
+    if (P::ASYNC_TEXTURE_UPLOADS && AsyncTextureUploadEnabled()) {
+        async_upload_workers =
+            std::make_unique<Common::ThreadWorker>(AsyncTextureUploadThreads(), "TextureUpload");
+        LOG_INFO(HW_GPU, "EDEN_NX2_TEX_UPLOAD_ASYNC: {} upload workers, uploads of {} KiB or more",
+                 AsyncTextureUploadThreads(), AsyncTextureUploadMinBytes() >> 10);
     }
 }
 
@@ -460,6 +542,10 @@ void TextureCache<P>::TickFrame() {
     sentenced_image_view.Tick();
     TickAsyncDecode();
     TickAsyncUnswizzle();
+    if (async_upload_workers) {
+        ResolveAsyncUploads(); // FillImageViews leaves none; nothing may cross a frame
+        LogAsyncUploadStats();
+    }
     if (frame_tick % 600 == 0 && !uploaded_ranges.empty()) {
         for (const auto& [address, size] : uploaded_ranges) {
             device_memory.HintCold(address, size);
@@ -502,6 +588,9 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 
 template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
+    // EDEN_NX2_TEX_UPLOAD_ASYNC: the uploads of the images refreshed below are recorded when this
+    // returns, before the draw or dispatch that binds them is.
+    const AsyncUploadBatch upload_batch{*this};
     bool has_blacklisted = false;
     do {
         has_deleted_images = false;
@@ -1717,6 +1806,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    if (True(image.flags & ImageFlagBits::UploadPending)) {
+        // Written again while its last upload is queued: that upload is recorded first.
+        ResolveAsyncUploads();
+    }
 
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -1771,7 +1864,13 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
-    if (!UploadInChunks(image)) {
+    bool queued = false;
+    if (async_upload_batch_depth != 0) {
+        queued = TryQueueAsyncUpload(image, image_id);
+    } else if (async_upload_workers) {
+        ++async_upload_stats.sync_outside;
+    }
+    if (!queued && !UploadInChunks(image)) {
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
         UploadImageContents(image, staging);
         runtime.InsertUploadMemoryBarrier();
@@ -2486,7 +2585,235 @@ void TextureCache<P>::TickAsyncUnswizzle() {
 }
 
 template <class P>
+TextureCache<P>::AsyncUploadBatch::AsyncUploadBatch(TextureCache& cache_)
+    : cache{cache_}, active{cache_.async_upload_workers != nullptr} {
+    if (active) {
+        ++cache.async_upload_batch_depth;
+    }
+}
+
+template <class P>
+TextureCache<P>::AsyncUploadBatch::~AsyncUploadBatch() {
+    if (active && --cache.async_upload_batch_depth == 0) {
+        cache.ResolveAsyncUploads();
+    }
+}
+
+template <class P>
+bool TextureCache<P>::TryQueueAsyncUpload(Image& image, ImageId image_id) {
+    auto& stats = async_upload_stats;
+    const u32 map_size = MapSizeBytes(image);
+    const bool accelerated = True(image.flags & ImageFlagBits::AcceleratedUpload);
+    if (map_size < AsyncTextureUploadMinBytes()) {
+        ++stats.sync_small;
+        return false;
+    }
+    if (map_size >= 64_MiB) {
+        ++stats.sync_large; // UploadInChunks and the by-layer uploads keep their own paths
+        return false;
+    }
+    constexpr ImageFlagBits sparse = ImageFlagBits::Sparse | ImageFlagBits::SparseLayers |
+                                     ImageFlagBits::SparseTiles | ImageFlagBits::UnwrittenSparse |
+                                     ImageFlagBits::Unbacked;
+    if (True(image.flags & sparse) || image.info.num_samples > 1) {
+        ++stats.sync_sparse;
+        return false;
+    }
+    // GpuModified stays off queued images (MarkModification resolves first): nothing downloads
+    // or copies from one before its upload is recorded.
+    if (True(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::IsDecoding |
+                            ImageFlagBits::AsynchronousDecode)) ||
+        (accelerated && image.host_level_offset != 0)) {
+        ++stats.sync_state;
+        return false;
+    }
+    // Guest memory is resolved here, on this thread, as UploadImageContents reads it: the worker
+    // gets host memory (physical backing, valid for the emulator's life) or a copy, and never
+    // calls the memory manager. The caller cleared CpuModified and tracked the image before this
+    // read, as before: a CPU write from now on marks it modified again and it is refreshed again.
+    const size_t source_size = accelerated ? map_size : image.guest_size_bytes;
+    const u8* const source = gpu_memory->GetSpan(image.gpu_addr, source_size);
+    if (accelerated && source == nullptr) {
+        ++stats.sync_noncontiguous;
+        return false;
+    }
+    std::shared_ptr<AsyncUploadJob> job;
+    if (!async_upload_free_jobs.empty()) {
+        job = std::move(async_upload_free_jobs.back());
+        async_upload_free_jobs.pop_back();
+        job->state.store(AsyncUploadJob::Queued, std::memory_order_relaxed);
+        job->copies.clear();
+        job->busy_ns = 0;
+        job->failed = false;
+        job->on_back = false;
+    } else {
+        job = std::make_shared<AsyncUploadJob>();
+    }
+    if (accelerated) {
+        // UploadImageContents reads it with ReadBlock: GPU-side buffer data reaches guest memory.
+        gpu_memory->FlushRegion(image.gpu_addr, source_size, VideoCommon::CacheType::NoTextureCache);
+    } else if (source == nullptr) {
+        job->source_copy.resize_destructive(source_size);
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, job->source_copy.data(), source_size);
+        ++stats.gathered;
+    }
+    job->info = image.info;
+    job->native_tiling = gpu_memory->UsesNativeTiling();
+    job->converted = True(image.flags & ImageFlagBits::Converted);
+    job->accelerated = accelerated;
+    job->source = source;
+    job->source_size = source_size;
+    job->unswizzled_size = image.unswizzled_size_bytes;
+    // Deferred: no other request takes this memory until the copy is recorded and freed, even if
+    // the scheduler submits in between.
+    AsyncBuffer staging = runtime.UploadStagingBuffer(map_size, true);
+    job->staging = std::span<u8>(staging.mapped_span).first(map_size);
+
+    image.flags |= ImageFlagBits::UploadPending;
+    async_uploads.push_back(PendingAsyncUpload{job, image_id, std::move(staging), false});
+    stats.queue_high_water = (std::max)(stats.queue_high_water, async_uploads.size());
+    ++stats.async_images;
+    stats.async_bytes += map_size;
+    async_upload_workers->QueueWork([job] {
+        if (ClaimAsyncUploadJob(*job)) {
+            RunAsyncUploadJob(*job);
+            FinishAsyncUploadJob(*job);
+        }
+    });
+    return true;
+}
+
+template <class P>
+void TextureCache<P>::ResolveAsyncUploads() {
+    if (async_uploads.empty()) {
+        return;
+    }
+    VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+    auto& stats = async_upload_stats;
+    ++stats.batches;
+    if (async_upload_batch_depth != 0) {
+        ++stats.early_resolves;
+    }
+    // Nothing below queues or cancels uploads: the list is stable while it is walked.
+    bool uploaded = false;
+    for (PendingAsyncUpload& pending : async_uploads) {
+        AsyncUploadJob& job = *pending.job;
+        if (ClaimAsyncUploadJob(job)) {
+            // No worker took it yet: run it here rather than wait (a dropped one needs no run).
+            if (!pending.cancelled) {
+                RunAsyncUploadJob(job);
+                job.on_back = true;
+                ++stats.back_ran;
+                stats.back_run_ns += job.busy_ns;
+            }
+            FinishAsyncUploadJob(job);
+        } else if (job.state.load(std::memory_order_acquire) != AsyncUploadJob::Done) {
+            const auto wait_start = std::chrono::steady_clock::now();
+            for (u32 state = job.state.load(std::memory_order_acquire);
+                 state != AsyncUploadJob::Done;
+                 state = job.state.load(std::memory_order_acquire)) {
+                job.state.wait(state, std::memory_order_acquire);
+            }
+            stats.back_wait_ns += static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count());
+        }
+        if (!job.on_back) {
+            stats.worker_busy_ns += job.busy_ns;
+        }
+        if (pending.cancelled) {
+            ++stats.cancelled;
+            runtime.FreeDeferredStagingBuffer(pending.staging);
+            continue;
+        }
+        Image& image = slot_images[pending.image_id];
+        image.flags &= ~ImageFlagBits::UploadPending;
+        if (job.failed) {
+            // The worker threw: the synchronous upload, reading guest memory again now.
+            ++stats.failed;
+            runtime.FreeDeferredStagingBuffer(pending.staging);
+            auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+            UploadImageContents(image, staging);
+            uploaded = true;
+            continue;
+        }
+        if (job.accelerated) {
+            runtime.AccelerateImageUpload(image, pending.staging, FullUploadSwizzles(image.info),
+                                          0, 0);
+        } else {
+            image.UploadMemory(pending.staging, job.copies);
+        }
+        // After the copy is recorded: the memory is free once this tick's submission completes.
+        runtime.FreeDeferredStagingBuffer(pending.staging);
+        uploaded = true;
+    }
+    for (PendingAsyncUpload& pending : async_uploads) {
+        // A job a worker still holds (its task not yet destroyed) is left to it.
+        if (pending.job.use_count() == 1 && async_upload_free_jobs.size() < 16) {
+            if (pending.job->source_copy.capacity() > 16_MiB) {
+                pending.job->source_copy.release();
+            }
+            async_upload_free_jobs.push_back(std::move(pending.job));
+        }
+    }
+    async_uploads.clear();
+    if (uploaded) {
+        runtime.InsertUploadMemoryBarrier();
+    }
+}
+
+template <class P>
+void TextureCache<P>::CancelAsyncUpload(ImageBase& image, ImageId image_id) {
+    image.flags &= ~ImageFlagBits::UploadPending;
+    for (PendingAsyncUpload& pending : async_uploads) {
+        if (pending.image_id == image_id && !pending.cancelled) {
+            pending.cancelled = true;
+        }
+    }
+}
+
+template <class P>
+void TextureCache<P>::LogAsyncUploadStats() {
+    const auto now = std::chrono::steady_clock::now();
+    if (async_upload_last_log == std::chrono::steady_clock::time_point{}) {
+        async_upload_last_log = now;
+        return;
+    }
+    const auto elapsed = now - async_upload_last_log;
+    if (elapsed < std::chrono::seconds{10}) {
+        return;
+    }
+    auto& stats = async_upload_stats;
+    const auto ms = [](u64 ns) { return static_cast<double>(ns) / 1e6; };
+    const double seconds = std::chrono::duration<double>(elapsed).count();
+    const u64 sync = stats.sync_outside + stats.sync_small + stats.sync_large + stats.sync_sparse +
+                     stats.sync_state + stats.sync_noncontiguous;
+    LOG_INFO(HW_GPU,
+             "Texture uploads in the last {:.1f} s: {} async ({} MiB, {} read here first) in {} "
+             "batches (queue high-water {}, {} resolved early), {} sync (outside FillImageViews "
+             "{}, small {}, large {}, sparse/MSAA {}, GPU modified/decoding {}, non-contiguous "
+             "{}), {} failed, {} dropped",
+             seconds, stats.async_images, stats.async_bytes >> 20, stats.gathered, stats.batches,
+             stats.queue_high_water, stats.early_resolves, sync, stats.sync_outside,
+             stats.sync_small, stats.sync_large, stats.sync_sparse, stats.sync_state,
+             stats.sync_noncontiguous, stats.failed, stats.cancelled);
+    LOG_INFO(HW_GPU,
+             "Texture upload workers in the last {:.1f} s: busy {:.1f} ms; GPU thread ran {} jobs "
+             "itself ({:.1f} ms) and waited {:.1f} ms for running ones",
+             seconds, ms(stats.worker_busy_ns), stats.back_ran, ms(stats.back_run_ns),
+             ms(stats.back_wait_ns));
+    stats = {};
+    async_upload_last_log = now;
+}
+
+template <class P>
 bool TextureCache<P>::ScaleUp(Image& image) {
+    if (True(image.flags & ImageFlagBits::UploadPending) &&
+        Settings::values.resolution_info.active) {
+        // The scale blit reads the image: its upload goes first.
+        ResolveAsyncUploads();
+    }
     const bool has_copy = image.HasScaled();
     const bool rescaled = image.ScaleUp();
     if (!has_copy && image.HasScaled()) {
@@ -2501,6 +2828,10 @@ bool TextureCache<P>::ScaleUp(Image& image) {
 
 template <class P>
 bool TextureCache<P>::ScaleDown(Image& image) {
+    if (True(image.flags & ImageFlagBits::UploadPending) &&
+        Settings::values.resolution_info.active) {
+        ResolveAsyncUploads();
+    }
     const bool rescaled = image.ScaleDown();
     if (!rescaled) {
         return false;
@@ -2763,6 +3094,15 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     } else {
         // TODO: Only upload what we need
         RefreshContents(new_image, new_image_id);
+        // The copies from GPU-modified overlaps below write over the upload: record it first
+        // (alias copies go through CopyImage, which does the same).
+        if (True(new_image.flags & ImageFlagBits::UploadPending) &&
+            std::ranges::any_of(join_copies_to_do, [this](const JoinCopy& copy) {
+                return !copy.is_alias &&
+                       True(slot_images[copy.id].flags & ImageFlagBits::GpuModified);
+            })) {
+            ResolveAsyncUploads();
+        }
     }
 
     if (can_rescale) {
@@ -3469,6 +3809,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             async_decode->cancelled = true;
         }
     }
+    if (True(image.flags & ImageFlagBits::UploadPending)) {
+        CancelAsyncUpload(image, image_id);
+    }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
@@ -3615,6 +3958,10 @@ void TextureCache<P>::RemoveFramebuffers(std::span<const ImageViewId> removed_vi
 
 template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
+    if (True(image.flags & ImageFlagBits::UploadPending)) {
+        // A queued image is never GPU modified, so no download or overlap copy reads it early.
+        ResolveAsyncUploads();
+    }
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
 }
@@ -3742,6 +4089,9 @@ template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
+    if (True((dst.flags | src.flags) & ImageFlagBits::UploadPending)) {
+        ResolveAsyncUploads();
+    }
     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
         True(src.flags & ImageFlagBits::UnwrittenSparse)) {
         return;

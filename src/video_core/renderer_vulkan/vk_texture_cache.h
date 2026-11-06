@@ -886,6 +886,8 @@ struct TextureCacheParams {
     static constexpr bool HAS_DEVICE_MEMORY_INFO = true;
     static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = true;
     static constexpr bool HAS_MSAA_DOWNLOADS = true;
+    /// EDEN_NX2_TEX_UPLOAD_ASYNC can queue uploads (deferred staging buffers keep their memory).
+    static constexpr bool ASYNC_TEXTURE_UPLOADS = true;
 
     using Runtime = Vulkan::TextureCacheRuntime;
     using Image = Vulkan::Image;

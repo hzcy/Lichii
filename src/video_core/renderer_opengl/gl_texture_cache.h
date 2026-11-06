@@ -373,6 +373,8 @@ struct TextureCacheParams {
     static constexpr bool HAS_DEVICE_MEMORY_INFO = true;
     static constexpr bool IMPLEMENTS_ASYNC_DOWNLOADS = true;
     static constexpr bool HAS_MSAA_DOWNLOADS = false;
+    /// EDEN_NX2_TEX_UPLOAD_ASYNC stays off: upload maps here are never deferred.
+    static constexpr bool ASYNC_TEXTURE_UPLOADS = false;
 
     using Runtime = OpenGL::TextureCacheRuntime;
     using Image = OpenGL::Image;

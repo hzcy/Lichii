@@ -60,6 +60,9 @@ enum class ImageFlagBits : u32 {
     /// device memory when the guest memory under it can hold data (Image::BindTiles), and only
     /// the parts written are uploaded.
     SparseTiles = 1 << 23,
+    /// EDEN_NX2_TEX_UPLOAD_ASYNC: refreshed, its CPU upload work queued on a worker; the copy is
+    /// recorded when the batch resolves (TextureCache::ResolveAsyncUploads).
+    UploadPending = 1 << 24,
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 

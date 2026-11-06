@@ -121,6 +121,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     active = true;
     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
+    // EDEN_NX2_DMA_READ_FAST=1: a macro's DMA read waits only for the queued work that may write
+    // what it reads (QueuedMemoryWrites) and drains only for pages GPU work ever wrote.
+    static const bool dma_read_fast = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_FAST");
+        return value != nullptr && value[0] != '0';
+    }();
+    track_memory_writes = front_macros && dma_read_fast;
     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
              front_macros ? ", macros on the first" : "");
 }
@@ -149,6 +156,8 @@ void GpuSplit::Stop() {
     consumed_cache = 0;
     publish_every = PublishEvery;
     front_engine = nullptr;
+    pairs_header = nullptr;
+    pairs_count = 0;
     back_engine = nullptr;
     front_macros = false;
     published.store(0, std::memory_order_relaxed);
@@ -179,6 +188,8 @@ void GpuSplit::WaitForSpace(size_t words) {
 }
 
 void GpuSplit::Publish() {
+    // The back may read what is published: the open Pairs block is final from here on.
+    pairs_header = nullptr;
     if (published_local == write_position) {
         return;
     }
@@ -189,6 +200,33 @@ void GpuSplit::Publish() {
         wake.fetch_add(1, std::memory_order_seq_cst);
         wake.notify_one();
     }
+    if ((macro_sink || compute_sink || ring_pairs) && (++publishes & 1023) == 0) [[unlikely]] {
+        ReportBatched();
+    }
+}
+
+void GpuSplit::ReportBatched() {
+    const auto now = std::chrono::steady_clock::now();
+    if (batched_since == std::chrono::steady_clock::time_point{}) {
+        batched_since = now;
+        batched.fill(0);
+        return;
+    }
+    const std::chrono::duration<double> elapsed = now - batched_since;
+    if (elapsed.count() < 10.0) {
+        return;
+    }
+    const auto rate = [&](Batched counter) {
+        return static_cast<double>(batched[static_cast<size_t>(counter)]) / elapsed.count();
+    };
+    LOG_INFO(HW_GPU,
+             "GPU split batched writes per second: split_batch.macro_sunk {:.0f}, "
+             "split_batch.compute_sunk {:.0f}, split_batch.compute_same {:.0f}, "
+             "split_batch.pairs {:.0f} in split_batch.pair_blocks {:.0f}",
+             rate(Batched::MacroSunk), rate(Batched::ComputeSunk), rate(Batched::ComputeSame),
+             rate(Batched::Pairs), rate(Batched::PairBlocks));
+    batched.fill(0);
+    batched_since = now;
 }
 
 void GpuSplit::Drain(DrainSite site) {
@@ -216,6 +254,11 @@ bool GpuSplit::WaitForWriters(DrainSite site) {
 
 bool GpuSplit::WaitForSync() {
     return WaitFor(std::min(last_sync_position, write_position), DrainSite::ListSync);
+}
+
+bool GpuSplit::WaitForMemoryWrites(const void* space, GPUVAddr address, u64 size) {
+    return WaitFor(std::min(queued_memory_writes.Target(space, address, size), write_position),
+                   DrainSite::MacroDmaWriters);
 }
 
 bool GpuSplit::WaitFor(u64 target, DrainSite site) {
@@ -378,6 +421,9 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
             Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
+        } else if ((head & Sink) != 0) {
+            engine->method_sink.emplace_back(
+                method | Tegra::Engines::EngineInterface::SplitPlainTag, argument);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
@@ -408,6 +454,16 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const size_t payload = static_cast<size_t>((head >> 8) & 0xffffff);
         reinterpret_cast<void (*)(const u64*)>(entry[1])(entry + 2);
         return 2 + payload;
+    }
+    case Kind::Pairs: {
+        // EDEN_NX2_RING_PAIRS: one profiler scope and one call for the block; the sink first,
+        // as for any other write, to keep the order.
+        const u32 count = static_cast<u32>(head >> 32);
+        auto* const engine = back_engine;
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
+        engine->ConsumeSink(*system);
+        engine->ApplyPairs(*system, entry + 1, count);
+        return 1 + size_t{count};
     }
     }
     return 1;

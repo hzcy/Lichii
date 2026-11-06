@@ -761,6 +761,17 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                 return true;
         }
     }
+    // sergio: EDEN_TIMING_COARSE=1 lets long waits (> 1.5 ms) sleep in the OS until ~1 ms before
+    // the deadline instead of holding the logical CPU in UMWAIT, then finishes precisely below.
+    static const bool coarse_waits = [] {
+        const char* v = std::getenv("EDEN_TIMING_COARSE");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (coarse_waits && time > std::chrono::microseconds(1500)) {
+        while (!is_set.load() && remaining() > std::chrono::microseconds(1000)) {
+            Common::Windows::SleepForOneTick();
+        }
+    }
     if (caps.waitpkg) {
         // #UD If CPUID.7.0:ECX.WAITPKG[bit 5]=0.
         while (true) {

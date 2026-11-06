@@ -3287,6 +3287,8 @@ private:
 
     void ConsumeSinkImpl(Core::System& system) override;
 
+    void ApplyPairs(Core::System& system, const u64* pairs, u32 count) override;
+
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
     /// CallMethod with every check, for the cases and tools CallMethodFast leaves out.

@@ -19,6 +19,7 @@
 #include <optional>
 #include <utility>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/cityhash.h"
 #include "common/common_types.h"
@@ -180,6 +181,14 @@ u64 GenericEnvironment::ReadInstruction(u32 address) {
     if (native_source_size) {
         throw Shader::RuntimeError("Lowered native instruction address out of range: {:#x}", address);
     }
+    if (async_snapshot) {
+        // Past the code SetCachedSize copied: only the memory manager has it, which a worker
+        // must not use. The pipeline is built again on the GPU thread.
+        async_missed = true;
+        throw Shader::RuntimeError("Instruction {:#x} is outside the code copied for a build "
+                                   "off the GPU thread",
+                                   address);
+    }
     has_unbound_instructions = true;
     return gpu_memory->Read<u64>(program_base + address);
 }
@@ -202,10 +211,27 @@ bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
     }
     const u64 address = u64{ReadCbufValue(index, offset)} |
                         (u64{ReadCbufValue(index, offset + 4)} << 32);
-    const bool mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-                        gpu_memory->IsFullyMappedRange(address, 1);
+    const bool mapped = async_snapshot
+                            ? AsyncPointerMapped(index, offset, address)
+                            : address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                                  gpu_memory->IsFullyMappedRange(address, 1);
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
     return mapped;
+}
+
+bool GenericEnvironment::AsyncPointerMapped(u32 index, u32 offset, u64 address) {
+    if (address == 0) {
+        return false;
+    }
+    if (async_stage != nullptr && index < async_stage->const_buffers.size() &&
+        offset % sizeof(u64) == 0) {
+        const auto& mapped = async_stage->const_buffers[index].pointer_mapped;
+        if (offset / sizeof(u64) < mapped.size()) {
+            return mapped[offset / sizeof(u64)];
+        }
+    }
+    async_missed = true;
+    return false;
 }
 
 bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) {
@@ -215,12 +241,17 @@ bool GenericEnvironment::IsCbufIndirectStorageBufferPointer(u32 index, u32 offse
     }
     bool mapped = false;
     if (IsCbufStorageBufferPointer(index, offset)) {
-        const u64 holder =
-            u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
-        if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
-            const u64 address = gpu_memory->Read<u64>(holder + indirect);
-            mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
-                     gpu_memory->IsFullyMappedRange(address, 1);
+        if (async_snapshot) {
+            // The pointer's target is guest memory the snapshot does not hold.
+            async_missed = true;
+        } else {
+            const u64 holder =
+                u64{ReadCbufValue(index, offset)} | (u64{ReadCbufValue(index, offset + 4)} << 32);
+            if (gpu_memory->IsFullyMappedRange(holder + indirect, sizeof(u64))) {
+                const u64 address = gpu_memory->Read<u64>(holder + indirect);
+                mapped = address != 0 && gpu_memory->IsWithinGPUAddressRange(address) &&
+                         gpu_memory->IsFullyMappedRange(address, 1);
+            }
         }
     }
     storage_pointer_types.emplace(key, static_cast<u8>(mapped));
@@ -856,7 +887,37 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
         maxwell3d->engine_state == Tegra::Engines::Maxwell3D::EngineHint::OnHLEMacro;
 }
 
+namespace {
+// What ReadCbufValue returns for a snapshotted buffer, or nullopt when the copy lacks the bytes.
+std::optional<u32> SnapshotCbufWord(const AsyncGraphicsSnapshot::ConstBuffer& cbuf, u32 offset) {
+    if (offset >= cbuf.size) {
+        return 0;
+    }
+    if (u64{offset} + sizeof(u32) > cbuf.bytes.size()) {
+        return std::nullopt;
+    }
+    u32 value;
+    std::memcpy(&value, cbuf.bytes.data() + offset, sizeof(value));
+    return value;
+}
+} // Anonymous namespace
+
 u32 GraphicsEnvironment::ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) {
+    if (async_snapshot) {
+        u32 value{};
+        const auto& buffers{async_stage->const_buffers};
+        // A disabled buffer asserts on the GPU thread; that build reports it.
+        const auto word = cbuf_index < buffers.size() && buffers[cbuf_index].enabled
+                              ? SnapshotCbufWord(buffers[cbuf_index], cbuf_offset)
+                              : std::nullopt;
+        if (word) {
+            value = *word;
+        } else {
+            async_missed = true;
+        }
+        cbuf_values.emplace(MakeCbufKey(cbuf_index, cbuf_offset), value);
+        return value;
+    }
     const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
     ASSERT(cbuf.enabled);
     u32 value{};
@@ -873,8 +934,10 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
         return std::nullopt;
     }
     const u64 key = (static_cast<u64>(bank) << 32) | static_cast<u64>(offset);
-    auto it = maxwell3d->replace_table.find(key);
-    if (it == maxwell3d->replace_table.end()) {
+    const auto& replace_table{async_snapshot ? async_snapshot->replace_table
+                                             : maxwell3d->replace_table};
+    auto it = replace_table.find(key);
+    if (it == replace_table.end()) {
         return std::nullopt;
     }
     const auto converted_value = [](Tegra::Engines::Maxwell3D::HLEReplacementAttributeType name) {
@@ -893,7 +956,25 @@ std::optional<Shader::ReplaceConstant> GraphicsEnvironment::GetReplaceConstBuffe
     return converted_value;
 }
 
+Tegra::Texture::TICEntry GraphicsEnvironment::ReadAsyncTextureInfo(u32 handle) {
+    const auto pair{Tegra::Texture::TexturePair(handle, async_snapshot->via_header_index)};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, async_snapshot->tic_limit,
+                                                       async_snapshot->native_tiling)};
+    // tic holds at most tic_limit + 1 entries: an index past the limit (an assert on the GPU
+    // thread) or past the copied part is left to that build.
+    if (index < async_snapshot->tic.size()) {
+        return async_snapshot->tic[index];
+    }
+    async_missed = true;
+    return Tegra::Texture::TICEntry{};
+}
+
 Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
+    if (async_snapshot) {
+        const Shader::TextureType result{ConvertTextureType(ReadAsyncTextureInfo(handle))};
+        texture_types.emplace(handle, result);
+        return result;
+    }
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
     auto entry =
@@ -904,6 +985,12 @@ Shader::TextureType GraphicsEnvironment::ReadTextureType(u32 handle) {
 }
 
 Shader::TexturePixelFormat GraphicsEnvironment::ReadTexturePixelFormat(u32 handle) {
+    if (async_snapshot) {
+        const Shader::TexturePixelFormat result(
+            ConvertTexturePixelFormat(ReadAsyncTextureInfo(handle)));
+        texture_pixel_formats.emplace(handle, result);
+        return result;
+    }
     const auto& regs{maxwell3d->regs};
     const bool via_header_index{regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding};
     auto entry =
@@ -919,9 +1006,96 @@ bool GraphicsEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 }
 
 u32 GraphicsEnvironment::ReadViewportTransformState() {
+    if (async_snapshot) {
+        viewport_transform_state = async_snapshot->viewport_transform_state;
+        return viewport_transform_state;
+    }
     const auto& regs{maxwell3d->regs};
     viewport_transform_state = regs.viewport_scale_offset_enabled;
     return viewport_transform_state;
+}
+
+std::shared_ptr<const AsyncGraphicsSnapshot> GraphicsEnvironment::SnapshotForAsync(
+    std::span<GraphicsEnvironment* const> envs) {
+    if (envs.empty()) {
+        return nullptr;
+    }
+    Tegra::Engines::Maxwell3D& engine{*envs.front()->maxwell3d};
+    Tegra::MemoryManager& memory{*envs.front()->gpu_memory};
+    const auto& regs{engine.regs};
+    auto snapshot{std::make_shared<AsyncGraphicsSnapshot>()};
+
+    snapshot->via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
+    snapshot->tic_limit = regs.tex_header.limit;
+    snapshot->native_tiling = memory.UsesNativeTiling();
+    snapshot->viewport_transform_state = regs.viewport_scale_offset_enabled;
+    if (std::ranges::any_of(envs, [](const GraphicsEnvironment* env) {
+            return env->has_hle_engine_state;
+        })) {
+        snapshot->replace_table = engine.replace_table;
+    }
+
+    // The whole header pool is what ReadTextureInfo could read (it asserts index <= limit). It is
+    // read as ReadTextureInfo reads an entry, flushing GPU writes first.
+    const size_t tic_entries{(std::min)(
+        size_t{snapshot->tic_limit} + 1,
+        AsyncGraphicsSnapshot::MaxTicBytes / sizeof(Tegra::Texture::TICEntry))};
+    snapshot->tic.resize(tic_entries);
+    memory.ReadBlock(regs.tex_header.Address(), snapshot->tic.data(),
+                     tic_entries * sizeof(Tegra::Texture::TICEntry));
+    snapshot->bytes += tic_entries * sizeof(Tegra::Texture::TICEntry);
+
+    std::array<bool, Maxwell::MaxShaderStage> copied{};
+    for (const GraphicsEnvironment* const env : envs) {
+        if (copied[env->stage_index]) {
+            continue; // VertexA and VertexB share the vertex stage's buffers
+        }
+        copied[env->stage_index] = true;
+        const auto& bound{engine.state.shader_stages[env->stage_index].const_buffers};
+        auto& stage{snapshot->stages[env->stage_index]};
+        for (size_t index = 0; index < bound.size(); ++index) {
+            const auto& info{bound[index]};
+            auto& cbuf{stage.const_buffers[index]};
+            cbuf.enabled = info.enabled;
+            cbuf.size = info.size;
+            if (!info.enabled || info.size == 0) {
+                continue;
+            }
+            const size_t copied_size{
+                Common::AlignUp((std::min<size_t>)(info.size, Maxwell::MaxConstBufferSize),
+                                sizeof(u64)) +
+                sizeof(u64)};
+            cbuf.bytes.resize(copied_size);
+            // ReadCbufValue reads with Read<u32>: no flush, and syncpoint values through the
+            // shim, which only a word-by-word read reproduces.
+            if (memory.OverlapsNativeSyncpointShim(info.address, copied_size)) {
+                for (size_t offset = 0; offset < copied_size; offset += sizeof(u32)) {
+                    const u32 word{memory.Read<u32>(info.address + offset)};
+                    std::memcpy(cbuf.bytes.data() + offset, &word, sizeof(word));
+                }
+            } else {
+                memory.ReadBlockUnsafe(info.address, cbuf.bytes.data(), copied_size);
+            }
+            snapshot->bytes += copied_size;
+
+            // IsCbufStorageBufferPointer's answer for every slot a pointer can be read from.
+            const size_t slots{copied_size / sizeof(u64) - 1};
+            cbuf.pointer_mapped.resize(slots);
+            for (size_t slot = 0; slot < slots; ++slot) {
+                const u32 offset{static_cast<u32>(slot * sizeof(u64))};
+                const u64 address{u64{*SnapshotCbufWord(cbuf, offset)} |
+                                  (u64{*SnapshotCbufWord(cbuf, offset + 4)} << 32)};
+                cbuf.pointer_mapped[slot] = address != 0 &&
+                                            memory.IsWithinGPUAddressRange(address) &&
+                                            memory.IsFullyMappedRange(address, 1);
+            }
+        }
+    }
+    for (GraphicsEnvironment* const env : envs) {
+        env->async_snapshot = snapshot;
+        env->async_stage = &snapshot->stages[env->stage_index];
+    }
+    return snapshot;
 }
 
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,

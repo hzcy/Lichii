@@ -56,7 +56,15 @@ public:
         // contiguous in host memory, so a single page lookup replaces the generic block read.
         const bool one_page =
             (gpu_addr & Core::Memory::YUZU_PAGEMASK) + sizeof(T) <= Core::Memory::YUZU_PAGESIZE;
-        if (const u8* const host = one_page ? gpu_memory.GetPointer(gpu_addr) : nullptr) {
+        const auto page_pointer = [&]() -> const u8* {
+            // Tegra::MemoryManager (EDEN_NX2_HANDLE_PTR_CACHE); test memories have GetPointer only.
+            if constexpr (requires { gpu_memory.GetPointerForDescriptor(gpu_addr); }) {
+                return gpu_memory.GetPointerForDescriptor(gpu_addr);
+            } else {
+                return gpu_memory.GetPointer(gpu_addr);
+            }
+        };
+        if (const u8* const host = one_page ? page_pointer() : nullptr) {
             std::memcpy(std::addressof(result.first), host, sizeof(T));
         } else {
             gpu_memory.ReadBlockUnsafe(gpu_addr, std::addressof(result.first), sizeof(T));

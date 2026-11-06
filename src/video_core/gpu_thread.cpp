@@ -181,6 +181,12 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                 } else {
                     ASSERT(false);
                 }
+                if (split.TracksMemoryWrites() &&
+                    (std::holds_alternative<RunCommand>(next.data) ||
+                     std::holds_alternative<FlushRegionCommand>(next.data))) {
+                    // Host requests and flushes may write guest memory (EDEN_NX2_DMA_READ_FAST).
+                    split.NoteMemoryWriter();
+                }
                 split.Defer([state_ptr = &state, fence = next.fence, block = next.block] {
                     SignalCommand(*state_ptr, fence, block);
                 });

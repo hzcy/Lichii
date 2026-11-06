@@ -936,6 +936,7 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         const DAddr orig_device_addr = static_cast<DAddr>(second_copy.src_offset);
         if (Nx2Profile::Enabled()) {
             u64 on_dma_pages = 0;
+            std::scoped_lock pages_lock{Nx2Profile::DmaReadPagesMutex()};
             const auto& pages = Nx2Profile::DmaReadPages();
             for (DAddr page = orig_device_addr >> 12; page <= (orig_device_addr + copy.size - 1) >> 12;
                  ++page) {

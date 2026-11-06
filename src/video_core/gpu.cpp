@@ -31,6 +31,7 @@
 #include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
+#include "video_core/fence_manager.h"
 #include "video_core/gpu.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
@@ -202,6 +203,10 @@ struct GPU::Impl {
 
     /// Push GPU command entries to be processed
     void PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
+        if (VideoCommon::FenceLightEnabled()) {
+            // Ordered after the guest's writes to the list's data (FenceManager::FenceLight).
+            VideoCommon::fence_light_submissions.fetch_add(1, std::memory_order_release);
+        }
         gpu_thread.SubmitList(channel, std::move(entries), is_async);
     }
 

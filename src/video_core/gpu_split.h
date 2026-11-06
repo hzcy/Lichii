@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -39,13 +42,105 @@ enum class DrainSite : u32 {
     Map,            ///< GPU memory maps before later command reads
     FrontStart,     ///< The front takes an engine's macros over
     FrontVerify,    ///< EDEN_NX2_FRONT_VERIFY
+    MacroDmaWriters, ///< EDEN_NX2_DMA_READ_FAST: queued work that may write what a macro reads
     Count,
 };
 
 inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)> drain_site_names{
     "other",       "fetch drain",     "acquire",    "semaphore flush", "fence release",
     "list writers", "list sync",      "list flush", "macro dma read",  "macro dma flush",
-    "gp sync fence", "map",           "front start", "front verify",
+    "gp sync fence", "map",           "front start", "front verify",   "macro dma writers",
+};
+
+/// Guest memory that work still queued for the split's back may write (EDEN_NX2_DMA_READ_FAST),
+/// by ring position: the ranges the front knows (constant buffer updates, semaphore and query
+/// releases), merged when close, and the position of the last work whose writes it cannot bound
+/// (compute, copies, inline uploads, waits for idle, host requests). Front thread only.
+class QueuedMemoryWrites {
+public:
+    static constexpr size_t MaxRanges = 8;
+    /// Ranges closer than this merge (consecutive pieces of a constant buffer ring).
+    static constexpr u64 MergeGap = 0x1000;
+
+    void NoteUnbounded(u64 position) {
+        unbounded = (std::max)(unbounded, position);
+    }
+
+    /// Work up to `position` writes [begin, begin + size) of address space `space`; the back has
+    /// executed everything up to `consumed`.
+    void Note(const void* space, u64 begin, u64 size, u64 position, u64 consumed) {
+        const u64 end = begin + size;
+        if (count != 0) {
+            Range& last = ranges[last_index];
+            if (last.space == space && begin >= last.begin && end <= last.end) {
+                last.position = position;
+                return;
+            }
+        }
+        // Ranges the back is past are done.
+        size_t kept = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (ranges[i].position > consumed) {
+                ranges[kept++] = ranges[i];
+            }
+        }
+        count = kept;
+        for (size_t i = 0; i < count; ++i) {
+            Range& range = ranges[i];
+            if (range.space == space && begin <= range.end + MergeGap &&
+                range.begin <= end + MergeGap) {
+                range.begin = (std::min)(range.begin, begin);
+                range.end = (std::max)(range.end, end);
+                range.position = position;
+                last_index = i;
+                return;
+            }
+        }
+        if (count == MaxRanges) {
+            // Full: the oldest range's work counts as unbounded from now on.
+            size_t oldest = 0;
+            for (size_t i = 1; i < count; ++i) {
+                if (ranges[i].position < ranges[oldest].position) {
+                    oldest = i;
+                }
+            }
+            NoteUnbounded(ranges[oldest].position);
+            ranges[oldest] = ranges[--count];
+        }
+        ranges[count] = Range{space, begin, end, position};
+        last_index = count++;
+    }
+
+    /// The position the back must pass before [begin, begin + size) of `space` holds what the
+    /// work sent so far writes there (0: nothing queued writes it).
+    [[nodiscard]] u64 Target(const void* space, u64 begin, u64 size) const {
+        const u64 end = begin + size;
+        u64 target = unbounded;
+        for (size_t i = 0; i < count; ++i) {
+            const Range& range = ranges[i];
+            if (range.position > target &&
+                (range.space != space || (begin < range.end && range.begin < end))) {
+                target = range.position;
+            }
+        }
+        return target;
+    }
+
+    void Reset() {
+        *this = QueuedMemoryWrites{};
+    }
+
+private:
+    struct Range {
+        const void* space;
+        u64 begin;
+        u64 end;
+        u64 position;
+    };
+    std::array<Range, MaxRanges> ranges{};
+    size_t count{};
+    size_t last_index{};
+    u64 unbounded{};
 };
 
 // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
@@ -70,6 +165,42 @@ public:
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
         return front_macros;
+    }
+
+    /// EDEN_NX2_MACRO_SINK=1 (default off): the state writes the front's 3D macros make
+    /// (registers outside execution_mask) go to the back's method sink like the command list's
+    /// own state writes, instead of one CallMethod each; the back applies its sink, in order,
+    /// before the engine's next executable method.
+    [[nodiscard]] static bool MacroSink() {
+        return macro_sink;
+    }
+    /// EDEN_NX2_COMPUTE_SINK=1 (default off): native compute writes that only store their value
+    /// (native_plain_methods), from macros or the command list, are dropped when the front's
+    /// register copy shows the back holds the value already, else sent batched (SinkMethod).
+    [[nodiscard]] static bool ComputeSink() {
+        return compute_sink;
+    }
+    /// EDEN_NX2_RING_PAIRS=1 (default off): the state writes that would go to the back's method
+    /// sink (the command list's 3D state writes; the 3D macros' with EDEN_NX2_MACRO_SINK, the
+    /// compute ones with EDEN_NX2_COMPUTE_SINK) go as (method, value) pairs in Pairs blocks
+    /// (PairWrite), which the back applies in one loop per block (EngineInterface::ApplyPairs),
+    /// after its method sink.
+    [[nodiscard]] static bool RingPairs() {
+        return ring_pairs;
+    }
+
+    /// The front's writes that took a batched path (EDEN_NX2_MACRO_SINK, EDEN_NX2_RING_PAIRS),
+    /// logged every 10 s.
+    enum class Batched : u32 {
+        MacroSunk,   ///< 3D macro state writes sent to the method sink (or as pairs)
+        ComputeSunk, ///< Compute state writes sent to the method sink (or as pairs)
+        ComputeSame, ///< Compute state writes dropped: the register held the value
+        Pairs,       ///< Writes sent as pairs (any engine, any source)
+        PairBlocks,  ///< Pairs blocks opened
+        Count,
+    };
+    void CountBatched(Batched counter, u64 amount = 1) {
+        batched[static_cast<size_t>(counter)] += amount;
     }
 
     /// Whether the calling thread is the back.
@@ -121,6 +252,42 @@ public:
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
                    (u64{argument} << 32);
         Commit(1);
+    }
+    /// EDEN_NX2_MACRO_SINK: a write that only stores a register's value, to an engine whose
+    /// execution_mask has the register (native compute): the back puts it in the engine's method
+    /// sink tagged EngineInterface::SplitPlainTag, applied before the engine's next other write.
+    void SinkMethod(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Sink | (u64{method & 0xffff} << 8) |
+                   (u64{argument} << 32);
+        Commit(1);
+    }
+    /// EDEN_NX2_RING_PAIRS: a write that only stores a register's value (no execution_mask side
+    /// effect; native compute: native_plain_methods), appended to the open Pairs block. A block
+    /// is open only until anything else is reserved or the ring is published (Reserve, Publish),
+    /// so published entries never change and a block never crosses the ring's end.
+    void PairWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        const u64 pair = u64{method & 0xffff} | (u64{argument} << 32);
+        const size_t index = write_position & RingMask;
+        if (pairs_header != nullptr && index != 0 && pairs_count < MaxPairs &&
+            write_position + 1 - consumed_cache <= RingWords) [[likely]] {
+            ring[index] = pair;
+            ++pairs_count;
+            *pairs_header = static_cast<u64>(Kind::Pairs) | (u64{pairs_count} << 32);
+            CountBatched(Batched::Pairs);
+            Commit(1);
+            return;
+        }
+        u64* const entry = Reserve(2);
+        entry[0] = static_cast<u64>(Kind::Pairs) | (u64{1} << 32);
+        entry[1] = pair;
+        pairs_header = entry;
+        pairs_count = 1;
+        CountBatched(Batched::Pairs);
+        CountBatched(Batched::PairBlocks);
+        Commit(2);
     }
 
     /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
@@ -206,10 +373,26 @@ private:
         Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
         Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
         Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+        Pairs,  ///< Bits 32-63 count; then one word per write: bits 0-15 method, 32-63 value
     };
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr u64 Sink = 1 << 7;   ///< Method: into the method sink, tagged (SinkMethod)
+
+    static inline const bool macro_sink = [] {
+        const char* value = std::getenv("EDEN_NX2_MACRO_SINK");
+        return value != nullptr && value[0] != '0';
+    }();
+    static inline const bool compute_sink = [] {
+        const char* value = std::getenv("EDEN_NX2_COMPUTE_SINK");
+        return value != nullptr && value[0] != '0';
+    }();
+    static inline const bool ring_pairs = [] {
+        const char* value = std::getenv("EDEN_NX2_RING_PAIRS");
+        return value != nullptr && value[0] != '0';
+    }();
+    static constexpr u32 MaxPairs = 4096;
 
     static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
     static constexpr size_t RingMask = RingWords - 1;
@@ -223,6 +406,7 @@ private:
 
     /// Room for an entry of `words` at the write position (never across the ring's end).
     u64* Reserve(size_t words) {
+        pairs_header = nullptr; // What follows ends the open Pairs block
         const size_t index = write_position & RingMask;
         if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
             [[likely]] {
@@ -276,6 +460,13 @@ private:
     /// Words between publishes: small right after a drain, while the back has nothing to do.
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
+    /// The open Pairs block's head (PairWrite), and its count.
+    u64* pairs_header{};
+    u32 pairs_count{};
+    std::array<u64, static_cast<size_t>(Batched::Count)> batched{};
+    std::chrono::steady_clock::time_point batched_since{};
+    u32 publishes{};
+    void ReportBatched();
 
     // Back side.
     Tegra::Engines::EngineInterface* back_engine{};

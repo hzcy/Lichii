@@ -7,9 +7,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -74,6 +76,30 @@ struct AsyncDecodeContext {
     std::mutex mutex;
     std::atomic_bool complete;
     bool cancelled{}; ///< The image was deleted meanwhile: drop the result (GPU thread only).
+};
+
+/// EDEN_NX2_TEX_UPLOAD_ASYNC: the CPU part of one image upload (unswizzle, convert or copy of the
+/// guest bytes into mapped staging memory), run by a worker or by the GPU thread itself. Inputs are
+/// set by the GPU thread before the job is queued; the job touches no cache, memory manager or
+/// scheduler, only `source` (host memory of the guest bytes) and `staging`.
+struct AsyncUploadJob {
+    enum State : u32 { Queued, Running, Done };
+    std::atomic<u32> state{Queued}; ///< Queued -> Running by whoever claims it, then Done
+
+    ImageInfo info;
+    bool native_tiling{};
+    bool converted{};   ///< ImageFlagBits::Converted: unswizzle into scratch, ConvertImage
+    bool accelerated{}; ///< ImageFlagBits::AcceleratedUpload: copy the guest bytes as they are
+    const u8* source{}; ///< Host memory of the guest bytes, or null: source_copy holds them
+    size_t source_size{};
+    Common::ScratchBuffer<u8> source_copy; ///< Read by the GPU thread when not host contiguous
+    u32 unswizzled_size{};
+    std::span<u8> staging; ///< Mapped staging memory, MapSizeBytes(image) long
+
+    boost::container::small_vector<BufferImageCopy, 16> copies;
+    u64 busy_ns{};
+    bool failed{};  ///< Threw: the GPU thread uploads the image synchronously instead
+    bool on_back{}; ///< Run by the GPU thread (it was still queued when the batch resolved)
 };
 
 using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
@@ -524,6 +550,26 @@ private:
     void TickAsyncDecode();
 
     void QueueAsyncUnswizzle(Image& image, ImageId image_id);
+
+    /// EDEN_NX2_TEX_UPLOAD_ASYNC: FillImageViews opens a batch; RefreshContents queues the CPU
+    /// part of eligible uploads on workers and ResolveAsyncUploads records them all when it closes.
+    struct AsyncUploadBatch {
+        explicit AsyncUploadBatch(TextureCache& cache_);
+        ~AsyncUploadBatch();
+        AsyncUploadBatch(const AsyncUploadBatch&) = delete;
+        AsyncUploadBatch& operator=(const AsyncUploadBatch&) = delete;
+        TextureCache& cache;
+        bool active;
+    };
+    /// Queues the upload of a refreshed image (its CpuModified already cleared, it tracked):
+    /// false when it stays synchronous.
+    bool TryQueueAsyncUpload(Image& image, ImageId image_id);
+    /// Waits for every queued upload (running the ones no worker took yet) and records them in
+    /// queue order, then one barrier.
+    void ResolveAsyncUploads();
+    /// DeleteImage: the queued upload of the image is dropped.
+    void CancelAsyncUpload(ImageBase& image, ImageId image_id);
+    void LogAsyncUploadStats();
     void TickAsyncUnswizzle();
 
     Runtime& runtime;
@@ -643,6 +689,41 @@ private:
 
     std::deque<PendingUnswizzle> unswizzle_queue;
     u8 current_unswizzle_frame;
+
+    // EDEN_NX2_TEX_UPLOAD_ASYNC state (GPU thread, under the cache mutex) and counters (logged
+    // every 10 s by TickFrame).
+    struct PendingAsyncUpload {
+        std::shared_ptr<AsyncUploadJob> job;
+        ImageId image_id;
+        AsyncBuffer staging;
+        bool cancelled{};
+    };
+    struct AsyncUploadStats {
+        u64 async_images{};
+        u64 async_bytes{};
+        u64 gathered{};          ///< Of them, guest bytes not host contiguous: read here first
+        u64 sync_outside{};      ///< Refreshed outside FillImageViews (render targets, blits, DMA)
+        u64 sync_small{};        ///< Under EDEN_NX2_TEX_UPLOAD_MIN_KIB
+        u64 sync_large{};        ///< 64 MiB or more (chunked or by-layer uploads)
+        u64 sync_sparse{};       ///< Sparse, unbacked or MSAA
+        u64 sync_state{};        ///< GPU modified, decoding, or trimmed accelerated levels
+        u64 sync_noncontiguous{}; ///< Accelerated upload over non-contiguous memory
+        u64 failed{};
+        u64 cancelled{};
+        u64 early_resolves{};    ///< Batches resolved before FillImageViews returned
+        u64 back_ran{};          ///< Jobs the GPU thread ran itself at resolve
+        u64 worker_busy_ns{};
+        u64 back_run_ns{};
+        u64 back_wait_ns{};      ///< GPU thread blocked on a job a worker was running
+        u64 batches{};
+        size_t queue_high_water{};
+    } async_upload_stats;
+    std::chrono::steady_clock::time_point async_upload_last_log{};
+    u32 async_upload_batch_depth{};
+    std::vector<PendingAsyncUpload> async_uploads;
+    std::vector<std::shared_ptr<AsyncUploadJob>> async_upload_free_jobs;
+    /// Declared after the jobs it runs: destroyed (its threads stopped and joined) before them.
+    std::unique_ptr<Common::ThreadWorker> async_upload_workers;
 
     // Join caching
     boost::container::small_vector<ImageId, 4> join_overlap_ids;

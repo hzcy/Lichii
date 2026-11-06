@@ -456,14 +456,14 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     const u32 second_offset{desc.secondary_cbuf_offset};
                     const GPUVAddr separate_addr{cbufs[desc.secondary_cbuf_index].address +
                                                  second_offset};
-                    const u32 lhs_raw{gpu_memory->Read<u32>(addr) << desc.shift_left};
-                    const u32 rhs_raw{gpu_memory->Read<u32>(separate_addr)
+                    const u32 lhs_raw{gpu_memory->ReadHandleWord(addr) << desc.shift_left};
+                    const u32 rhs_raw{gpu_memory->ReadHandleWord(separate_addr)
                                       << desc.secondary_shift_left};
                     const u32 raw{lhs_raw | rhs_raw};
                     return TexturePair(raw, via_header_index);
                 }
             }
-            return TexturePair(gpu_memory->Read<u32>(addr), via_header_index);
+            return TexturePair(gpu_memory->ReadHandleWord(addr), via_header_index);
         }};
         const auto add_image{[&](const auto& desc, bool blacklist) LAMBDA_FORCEINLINE {
             for (u32 index = 0; index < desc.count; ++index) {

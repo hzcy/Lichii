@@ -7,6 +7,8 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <queue>
 
@@ -23,12 +26,26 @@
 #include "common/thread.h"
 #include "video_core/delayed_destruction_ring.h"
 #include "video_core/gpu.h"
+#include "video_core/gpu_wait_site.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace VideoCommon {
+
+/// EDEN_NX2_FENCE_LIGHT=1 (default off): lighter fences (FenceManager::SignalFenceImpl).
+inline bool FenceLightEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_FENCE_LIGHT");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+
+/// Guest command list submissions (GPU::PushGPUEntries), counted only with EDEN_NX2_FENCE_LIGHT:
+/// the first fence the GPU thread signals after one gathers the guest's CPU writes at once.
+inline std::atomic<u64> fence_light_submissions{0};
 
 class FenceBase {
 public:
@@ -80,16 +97,78 @@ public:
     }
 
     void SignalFence(std::function<void()>&& func) {
+        SignalFenceImpl(std::move(func), false);
+    }
+
+    /// EDEN_NX2_DOWNLOAD_COALESCE=1 (default off): at low GPU accuracy, a fence made on the split's
+    /// back while its submission is deferred anyway (Scheduler::DeferFlush, ~500 us windows)
+    /// leaves the buffer downloads uncommitted; the next fence past the window commits them all
+    /// at once, before that submission. Syncpoint fences, forced waits (WaitPendingFences) and
+    /// the back's idle hook (CommitCoalescedDownloads) always commit.
+    static bool CoalesceDownloads() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("EDEN_NX2_DOWNLOAD_COALESCE");
+            return value != nullptr && value[0] != '0';
+        }();
+        return enabled;
+    }
+
+    /// Commits the buffer downloads fences left for later (CoalesceDownloads) with a fence of
+    /// their own. The split's back calls it before it submits deferred work and sleeps.
+    void CommitCoalescedDownloads() {
+        if (coalesced_downloads) {
+            SignalFenceImpl([] {}, true);
+        }
+    }
+
+    /// EDEN_NX2_FENCE_LIGHT=1 (default off). Switch 2 titles signal a fence per compute dispatch
+    /// (3,000-11,000 a second); each one also gathered the guest's CPU writes (one lock per CPU
+    /// core), woke the fencing thread (a system call when it slept) and allocated its fence.
+    /// With the switch:
+    /// - the gather runs at most once per EDEN_NX2_FENCE_LIGHT_US (default 500 us, the deferred
+    ///   submission window), and always at a fence that carries downloads, a syncpoint or forced
+    ///   wait (commit_downloads), in accurate fence modes, and at the first fence after the
+    ///   guest submitted a command list (fence_light_submissions);
+    /// - the fencing thread is notified only while it waits on the condition variable;
+    /// - one clock read serves the flush window test, the fence's submission and the throttle;
+    /// - stubbed fences share one object and the others come from a free list (backend).
+    /// Invariant: the gather applies guest CPU writes into GPU-written buffer pages (the only
+    /// writes deferred to it, GPU::OnCPUWrite); every other CPU write is applied when made. A
+    /// command recorded after the first fence that follows a guest submission sees every write
+    /// made before that submission, as before (the guest orders its writes before the list that
+    /// reads them). Fences that commit downloads gather as before, and also before the commit
+    /// when a gather was skipped since the last one (LightGatherBeforeDownloads). Not kept: a
+    /// write ordered only by a semaphore the GPU acquires (no submission) waits for the first
+    /// fence past the interval instead of the first fence after the acquire.
+    static bool FenceLight() {
+        return FenceLightEnabled();
+    }
+
+private:
+    void SignalFenceImpl(std::function<void()>&& func, bool commit_downloads) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
-        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? Settings::IsGPULevelHigh() : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
+        // at each command list end): read once, every decision of this fence uses one value.
+        const bool level_high = Settings::IsGPULevelHigh();
+        const bool delay_fence = Settings::IsGPUFenceBehaviorDefault() ? level_high : Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
-        auto [should_flush, committed_flushes] = CommitCacheFlushes();
+        const bool light = FenceLight();
+        const auto now = light ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool defer_downloads = CoalesceDownloads() && !commit_downloads && !delay_fence &&
+                                     !level_high &&
+                                     (light ? InFlushWindowAt(now) : InFlushWindow());
+        if (light && light_gather_pending) {
+            LightGatherBeforeDownloads(now);
+        }
+        auto [should_flush, committed_flushes] = CommitCacheFlushes(defer_downloads);
         if (!delay_fence && committed_flushes == 0 && SkipEmptyFence()) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             func();
-            rasterizer.InvalidateGPUCache();
+            if (!light || LightGatherDue(now, commit_downloads)) {
+                rasterizer.InvalidateGPUCache();
+            }
             return;
         }
         skipped_fences = 0;
@@ -108,7 +187,11 @@ public:
             uncommitted_operations.clear(); // moved-from: make it empty explicitly
         }
         pending_flushes.push_back(committed_flushes);
-        QueueFence(new_fence);
+        if (light) {
+            QueueFenceAt(new_fence, now);
+        } else {
+            QueueFence(new_fence);
+        }
         if (!delay_fence) {
             func();
         }
@@ -117,12 +200,110 @@ public:
             rasterizer.FlushCommands();
         }
         if constexpr (can_async_check) {
+            // Read under the guard: the fencing thread sets it under the guard before it sleeps,
+            // and finds this fence if it takes the guard first.
+            const bool wake = !light || fence_thread_waiting;
             guard.unlock();
-            cv.notify_all();
+            if (wake) {
+                cv.notify_all();
+            }
+            if (light) {
+                LightCount(wake ? light_stats.notifies : light_stats.notifies_skipped);
+            }
         }
-        rasterizer.InvalidateGPUCache();
+        if (delay_fence) {
+            // Its callback runs on the fencing thread once the fence's work is done, and the
+            // guest or WaitPendingFences may block on that callback: a submission left for
+            // later (Scheduler::DeferFlush) would wait for the back to go idle, which it then
+            // never does (GPU accuracy switched to High while the game ran, 24 s and more).
+            SubmitDeferredWork();
+        }
+        if (!light || LightGatherDue(now, commit_downloads || delay_fence || committed_flushes != 0)) {
+            rasterizer.InvalidateGPUCache();
+        }
     }
 
+    static void LightCount(std::atomic<u64>& counter) {
+        counter.store(counter.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+
+    /// EDEN_NX2_FENCE_LIGHT: whether this fence gathers the guest's CPU writes (FenceLight).
+    bool LightGatherDue(std::chrono::steady_clock::time_point now, bool force) {
+        static const std::chrono::microseconds interval{[] {
+            const char* value = std::getenv("EDEN_NX2_FENCE_LIGHT_US");
+            return value == nullptr ? s64{500} : static_cast<s64>(std::atoll(value));
+        }()};
+        const u64 submissions = fence_light_submissions.load(std::memory_order_acquire);
+        const bool submitted = submissions != light_seen_submissions;
+        const bool due = force || submitted || now - light_last_gather >= interval;
+        if (due) {
+            light_seen_submissions = submissions;
+            light_last_gather = now;
+            light_gather_pending = false;
+            LightCount(submitted && !force ? light_stats.gathers_submission : light_stats.gathers);
+        } else {
+            light_gather_pending = true;
+            LightCount(light_stats.gathers_skipped);
+        }
+        if (now - light_last_log >= std::chrono::seconds{10}) {
+            LogLightStats(now);
+        }
+        return due;
+    }
+
+    /// FenceLight, with a gather skipped since the last one: a download committed now is copied
+    /// over guest memory later, and would overwrite a CPU write the skipped gather left pending
+    /// (the cache would not know the CPU wrote there). Gather first when a cache has downloads
+    /// to commit, as the per-fence gather of the previous fence did.
+    void LightGatherBeforeDownloads(std::chrono::steady_clock::time_point now) {
+        bool downloads = false;
+        {
+            std::scoped_lock lock{texture_cache.mutex};
+            downloads = texture_cache.HasUncommittedFlushes() || texture_cache.HasAsyncFlushWork();
+        }
+        if (!downloads) {
+            std::scoped_lock lock{buffer_cache.mutex};
+            downloads = buffer_cache.HasUncommittedFlushes();
+        }
+        if (!downloads) {
+            return;
+        }
+        rasterizer.InvalidateGPUCache();
+        light_seen_submissions = fence_light_submissions.load(std::memory_order_acquire);
+        light_last_gather = now;
+        light_gather_pending = false;
+        LightCount(light_stats.gathers_download);
+    }
+
+    void LogLightStats(std::chrono::steady_clock::time_point now) {
+        if (light_last_log == std::chrono::steady_clock::time_point{}) {
+            light_last_log = now;
+            return;
+        }
+        const double seconds = std::chrono::duration<double>(now - light_last_log).count();
+        light_last_log = now;
+        const auto take = [seconds](std::atomic<u64>& counter) {
+            return static_cast<u64>(
+                static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / seconds);
+        };
+        const u64 gathers = take(light_stats.gathers);
+        const u64 gathers_submission = take(light_stats.gathers_submission);
+        const u64 gathers_skipped = take(light_stats.gathers_skipped);
+        const u64 gathers_download = take(light_stats.gathers_download);
+        const u64 notifies = take(light_stats.notifies);
+        const u64 notifies_skipped = take(light_stats.notifies_skipped);
+        const auto [stubs_shared, fences_pooled] = TakeLightFenceObjects();
+        LOG_INFO(HW_GPU,
+                 "EDEN_NX2_FENCE_LIGHT per second: gathers {} (+{} after a guest submission, "
+                 "+{} before downloads), gathers skipped {}, notifies {}, notifies skipped {}, "
+                 "stub fences shared {}, fences from the free list {}",
+                 gathers, gathers_submission, gathers_download, gathers_skipped, notifies,
+                 notifies_skipped,
+                 static_cast<u64>(static_cast<double>(stubs_shared) / seconds),
+                 static_cast<u64>(static_cast<double>(fences_pooled) / seconds));
+    }
+
+public:
     void SignalSyncPoint(u32 value) {
         // The id comes from a command list (the 3D engine's sync method, the puller's fence
         // action). Past the syncpoint table, the increment would walk memory after it as an
@@ -133,7 +314,8 @@ public:
         }
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
-        SignalFence(std::move(func));
+        // The guest CPU waits on syncpoints: their fences carry every pending download.
+        SignalFenceImpl(std::move(func), true);
     }
 
     void WaitPendingFences([[maybe_unused]] bool force) {
@@ -259,7 +441,13 @@ private:
         while (!stop_token.stop_requested()) {
             {
                 std::unique_lock lock(guard);
-                cv.wait(lock, [&] { return stop_token.stop_requested() || !fences.empty(); });
+                // cv.wait with that predicate, telling SignalFenceImpl when it sleeps (FenceLight
+                // notifies only then).
+                while (!stop_token.stop_requested() && fences.empty()) {
+                    fence_thread_waiting = true;
+                    cv.wait(lock);
+                    fence_thread_waiting = false;
+                }
                 if (stop_token.stop_requested()) [[unlikely]] {
                     return;
                 }
@@ -343,7 +531,7 @@ private:
     /// lock is taken once, alone, and the fencing thread later takes only the lock of the cache
     /// with work, instead of holding both while it copies (the GPU thread's draws and uploads
     /// waited for it).
-    CacheFlushes CommitCacheFlushes() {
+    CacheFlushes CommitCacheFlushes(bool defer_buffer_downloads) {
         CacheFlushes flushes{};
         {
             std::scoped_lock lock{texture_cache.mutex};
@@ -356,9 +544,16 @@ private:
         {
             std::scoped_lock lock{buffer_cache.mutex};
             if (buffer_cache.HasUncommittedFlushes()) {
-                buffer_cache.CommitAsyncFlushes();
-                flushes.should_flush = true;
-                flushes.committed |= BufferFlushes;
+                if (defer_buffer_downloads) {
+                    coalesced_downloads = true;
+                } else {
+                    buffer_cache.CommitAsyncFlushes();
+                    flushes.should_flush = true;
+                    flushes.committed |= BufferFlushes;
+                }
+            }
+            if (!defer_buffer_downloads) {
+                coalesced_downloads = false;
             }
         }
         return flushes;
@@ -392,6 +587,22 @@ private:
     std::deque<std::deque<std::function<void()>>> pending_operations;
     std::deque<u8> pending_flushes; ///< Per fence: the caches that committed downloads
     u32 skipped_fences{}; ///< Empty fences skipped since the last one made (GPU thread only)
+    bool coalesced_downloads{}; ///< Buffer downloads left uncommitted (CoalesceDownloads)
+    bool fence_thread_waiting{}; ///< The fencing thread sleeps on cv (guarded by guard)
+
+    // FenceLight state (GPU thread only) and counters (logged every 10 s).
+    std::chrono::steady_clock::time_point light_last_gather{};
+    std::chrono::steady_clock::time_point light_last_log{};
+    u64 light_seen_submissions{};
+    bool light_gather_pending{}; ///< A gather was skipped since the last one
+    struct LightStats {
+        std::atomic<u64> gathers{};
+        std::atomic<u64> gathers_submission{};
+        std::atomic<u64> gathers_skipped{};
+        std::atomic<u64> gathers_download{};
+        std::atomic<u64> notifies{};
+        std::atomic<u64> notifies_skipped{};
+    } light_stats;
 
     std::mutex guard;
     std::mutex ring_guard;

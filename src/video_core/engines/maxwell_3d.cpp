@@ -349,6 +349,29 @@ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
     method_sink.clear();
 }
 
+void Maxwell3D::ApplyPairs(Core::System& system, const u64* pairs, u32 count) {
+    // EDEN_NX2_RING_PAIRS: state writes the front would have sunk (never in execution_mask),
+    // applied as ConsumeSinkImpl applies the sink. The shadow RAM mode cannot change inside a
+    // block: shadow_ram_control is executable, and any other entry ends the block.
+    const auto control = shadow_state.shadow_ram_control;
+    const bool track = control == Regs::ShadowRamControl::Track ||
+                       control == Regs::ShadowRamControl::TrackWithFilter;
+    const bool replay = control == Regs::ShadowRamControl::Replay;
+    const bool skip_same = SkipSameValueWrites();
+    for (u32 i = 0; i < count; ++i) {
+        const u32 method = static_cast<u32>(pairs[i] & 0xffff);
+        u32 value = static_cast<u32>(pairs[i] >> 32);
+        if (track) {
+            shadow_state.reg_array[method] = value;
+        } else if (replay) {
+            value = shadow_state.reg_array[method];
+        }
+        if (!skip_same || regs.reg_array[method] != value) {
+            ProcessDirtyRegisters(method, value);
+        }
+    }
+}
+
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
     // The instances after the first are drawn together once their loop ends, and they must see
     // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
@@ -1089,6 +1112,38 @@ bool FrontHandledOutsideDrawManager(u32 method) {
     }
 }
 
+// EDEN_NX2_DMA_READ_FAST (GpuSplit::TracksMemoryWrites): what a 3D method just sent to the back
+// writes in guest memory. Constant buffer updates write the bound buffer, reports their 16 bytes;
+// inline uploads and waits for idle (they write query results) are not bounded.
+void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, const void* space, const u32* regs,
+                          u32 method) {
+    constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+    if (method >= cb_data && method < cb_data + 16) {
+        const GPUVAddr address =
+            (GPUVAddr{regs[MAXWELL3D_REG_INDEX(const_buffer.address_high)]} << 32) |
+            regs[MAXWELL3D_REG_INDEX(const_buffer.address_low)];
+        split.NoteMemoryWrite(space, address, regs[MAXWELL3D_REG_INDEX(const_buffer.size)]);
+        return;
+    }
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(report_semaphore.query): {
+        const GPUVAddr address =
+            (GPUVAddr{regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        split.NoteMemoryWrite(space, address, 16);
+        return;
+    }
+    case MAXWELL3D_REG_INDEX(launch_dma):
+    case MAXWELL3D_REG_INDEX(inline_data):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+        split.NoteMemoryWriter();
+        return;
+    default:
+        return;
+    }
+}
+
 // EDEN_NX2_SPLIT_SKIP=0: send state writes that keep the register's value too.
 bool FrontSkipSame() {
     static const bool skip = [] {
@@ -1389,7 +1444,22 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
-    split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    bool drain = true;
+    if (split.TracksMemoryWrites()) {
+        // EDEN_NX2_DMA_READ_FAST: wait only for the queued work that may write these words, then
+        // read guest memory unless GPU work ever wrote one of their pages (the buffer cache may
+        // hold newer words: drain and flush as below) or they are syncpoint values.
+        split.WaitForMemoryWrites(&memory_manager, source, read_bytes);
+        drain = memory_manager.OverlapsNativeSyncpointShim(source, read_bytes);
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; !drain && page < source + read_bytes;
+             page += 0x1000) {
+            const auto device = memory_manager.GpuToCpuAddress(page);
+            drain = !device || Tegra::Nx2IsGpuWritten(*device);
+        }
+    }
+    if (drain) {
+        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
+    }
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
         split.Run(
@@ -1415,7 +1485,17 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         }
     }
     if (VideoCommon::Nx2Profile::Enabled()) {
-        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+        namespace Profile = VideoCommon::Nx2Profile;
+        Profile::Add(Profile::Counter::DmaReadBytes, read_bytes);
+        if (!drain) {
+            Profile::Add(Profile::Counter::DmaReadsFast, 1);
+        }
+        // The back's buffer downloads count the bytes on these pages (BufferCache).
+        for (GPUVAddr page = source & ~GPUVAddr{0xfff}; page < source + read_bytes; page += 0x1000) {
+            if (const auto device = memory_manager.GpuToCpuAddress(page)) {
+                Profile::AddDmaReadPage(*device >> 12);
+            }
+        }
     }
     if (gpu_written) {
         split.Drain(VideoCommon::DrainSite::MacroDmaRead);
@@ -1462,9 +1542,21 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
                                ? shadow_state.reg_array[method]
                                : value;
     }
+    // EDEN_NX2_MACRO_SINK sinks macro writes too: in a tracking mode their shadow RAM copies are
+    // written only when the sink is applied, so they count as done for the shadow check as well
+    // (else the check would "resynchronize" the front's shadow to older values).
+    std::array<u32, Regs::NUM_REGS> expected_shadow;
+    std::memcpy(expected_shadow.data(), shadow_state.reg_array.data(), sizeof(expected_shadow));
+    if (VideoCommon::GpuSplit::MacroSink() &&
+        (shadow_state.shadow_ram_control == Regs::ShadowRamControl::Track ||
+         shadow_state.shadow_ram_control == Regs::ShadowRamControl::TrackWithFilter)) {
+        for (const auto& [method, value] : method_sink) {
+            expected_shadow[method] = value;
+        }
+    }
     static u64 control_differences{};
     if ((fs.control != shadow_state.shadow_ram_control ||
-         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != shadow_state.reg_array[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
+         fs.shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected_shadow[MAXWELL3D_REG_INDEX(shadow_ram_control)] ||
          fs.regs[MAXWELL3D_REG_INDEX(shadow_ram_control)] != expected[MAXWELL3D_REG_INDEX(shadow_ram_control)]) &&
         control_differences < 4) {
         LOG_WARNING(HW_GPU, "Split shadow RAM control writes, front ({} total) / back ({} total):",
@@ -1494,12 +1586,12 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
         fs.control = shadow_state.shadow_ram_control;
     }
     for (u32 i = 0; i < Regs::NUM_REGS; ++i) {
-        if (fs.shadow[i] != shadow_state.reg_array[i]) {
+        if (fs.shadow[i] != expected_shadow[i]) {
             if (control_differences++ < 16) {
                 LOG_WARNING(HW_GPU, "Split front shadow register {:#x}: front {:#x}, back {:#x}", i,
-                            fs.shadow[i], shadow_state.reg_array[i]);
+                            fs.shadow[i], expected_shadow[i]);
             }
-            fs.shadow[i] = shadow_state.reg_array[i];
+            fs.shadow[i] = expected_shadow[i];
         }
     }
     if ((checks & 63) == 1) {
