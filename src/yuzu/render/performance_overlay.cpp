@@ -10,10 +10,12 @@
 #include <QChart>
 #include <QChartView>
 #include <QGraphicsLayout>
+#include <QGuiApplication>
 #include <QLineSeries>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QValueAxis>
+#include <QWindow>
 
 // TODO(crueter): Reset samples when user changes turbo, slow, etc.
 PerformanceOverlay::PerformanceOverlay(MainWindow* parent)
@@ -188,9 +190,16 @@ void PerformanceOverlay::paintEvent(QPaintEvent* event) {
 }
 
 void PerformanceOverlay::mousePressEvent(QMouseEvent* event) {
-    if (event->button() == Qt::LeftButton) {
-        m_drag_start_pos = event->pos();
+    if (event->button() != Qt::LeftButton) {
+        return;
     }
+    // Wayland ignores move() on top-level windows, so the overlay sat where the compositor put it:
+    // let the compositor drag it instead.
+    if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland")) && windowHandle() &&
+        windowHandle()->startSystemMove()) {
+        return;
+    }
+    m_drag_start_pos = event->pos();
 }
 
 void PerformanceOverlay::mouseMoveEvent(QMouseEvent* event) {
