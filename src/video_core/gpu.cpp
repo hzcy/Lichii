@@ -162,10 +162,13 @@ struct GPU::Impl {
 
     [[nodiscard]] u64 GetTicks() const {
         return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
-                                Settings::values.gpu_clock.GetValue());
+                                Settings::values.gpu_clock.GetValue(),
+                                present_ns.load(std::memory_order_relaxed));
     }
 
     void RendererFrameEndNotify() {
+        present_ns.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
+                         std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -363,6 +366,7 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
+    std::atomic<u64> present_ns{};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
