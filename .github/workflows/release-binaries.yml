@@ -309,6 +309,7 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=OFF
           -DYUZU_TESTS=OFF
+          -DLICHII_AV1_SMOKE_TEST=ON
           -DYUZU_CMD=ON
           -DYUZU_ROOM=OFF
           -DYUZU_ROOM_STANDALONE=OFF
@@ -357,6 +358,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
             -DYUZU_TESTS=OFF \
+            -DLICHII_AV1_SMOKE_TEST=ON \
             -DYUZU_CMD=ON \
             -DYUZU_ROOM=OFF \
             -DYUZU_ROOM_STANDALONE=OFF \
@@ -389,6 +391,9 @@ jobs:
         run: |
           if command -v ccache > /dev/null; then ccache --zero-stats; else sccache --zero-stats; fi
           cmake --build build/release --target yuzu yuzu-cmd --parallel
+          if [ '${{ matrix.platform }}' = 'windows-x86_64' ]; then
+            cmake --build build/release --target av1_decode_smoke --parallel 2
+          fi
           if command -v ccache > /dev/null; then ccache --show-stats; else sccache --show-stats; fi
 
       - name: Build MinGW PGO
@@ -397,6 +402,7 @@ jobs:
         run: |
           ccache --zero-stats
           cmake --build build/release --target yuzu yuzu-cmd --parallel
+          cmake --build build/release --target av1_decode_smoke --parallel 2
           ccache --show-stats
 
       - name: Stop sccache on Windows
@@ -515,6 +521,28 @@ jobs:
           find . -name '*.dll' | while read -r dll; do
             deps "$dll"
           done
+
+      - name: Check packaged Windows AV1 decoding
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $buildPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            Push-Location build/release/bin
+            try {
+              & ./av1_decode_smoke.exe
+              if ($LASTEXITCODE -ne 0) { throw "Packaged AV1 decoding failed: $LASTEXITCODE" }
+              Remove-Item -LiteralPath ./av1_decode_smoke.exe
+              if (Test-Path -LiteralPath ./av1_decode_smoke.pdb) {
+                Remove-Item -LiteralPath ./av1_decode_smoke.pdb
+              }
+            } finally {
+              Pop-Location
+            }
+          } finally {
+            $env:PATH = $buildPath
+          }
 
       # A self-contained app bundle: macdeployqt copies Qt and every other Homebrew library both
       # programs load into the bundle, then the leftover Homebrew search paths are removed so a

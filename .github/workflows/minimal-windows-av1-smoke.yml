@@ -1,0 +1,129 @@
+name: Windows MinGW AV1 smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  av1-smoke:
+    name: Build and package the MinGW AV1 probe
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq pactoys ninja
+          pacboy: >-
+            toolchain:p clang:p lld:p cmake:p python-pip:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
+            vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
+            libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
+            lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p ffmpeg:p
+
+      - name: Restore CPM downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-windows-x86_64-pgo-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-windows-x86_64-pgo-v2-
+            cpm-windows-x86_64-v2-
+            cpm-Windows-
+
+      - name: Configure production AV1 probe
+        run: >-
+          cmake -S . -B build/av1-smoke -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DLICHII_AV1_SMOKE_TEST=ON
+          -DENABLE_QT=OFF
+          -DYUZU_CMD=OFF
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_FFMPEG=OFF
+          -DYUZU_USE_EXTERNAL_FFMPEG=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DCMAKE_C_COMPILER=clang
+          -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld
+
+      - name: Build only the AV1 probe
+        run: cmake --build build/av1-smoke --target av1_decode_smoke --parallel 2
+
+      - name: Collect the probe DLL closure
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:$PATH"
+          cd build/av1-smoke/bin
+          test -f av1_decode_smoke.exe
+          deps() {
+            objdump -p "$1" | awk '/DLL Name:/ {print $3}' | while read -r dll; do
+              [ -z "$dll" ] && continue
+              source=$(command -v "$dll" 2>/dev/null || true)
+              [ -z "$source" ] && continue
+              case "$source" in
+                *System32* | *SysWOW64*) continue ;;
+              esac
+              if [ ! -f "$dll" ]; then
+                cp "$source" "$dll"
+                deps "$source"
+              fi
+            done
+          }
+          deps av1_decode_smoke.exe
+          find . -name '*.dll' -print0 | while IFS= read -r -d '' dll; do
+            deps "$dll"
+          done
+
+      - name: Run from the packaged directory with system-only PATH
+        shell: pwsh
+        run: |
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE 'build/av1-smoke/bin'
+          $report = Join-Path $packageDir 'av1-smoke-report.txt'
+          $oldPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            Push-Location $packageDir
+            try {
+              $output = & ./av1_decode_smoke.exe 2>&1
+              $exitCode = $LASTEXITCODE
+              $output | Out-File -FilePath $report -Encoding utf8
+              if ($exitCode -ne 0) {
+                "FAIL: exit code $exitCode" | Add-Content -Path $report
+                throw "Packaged AV1 probe failed: $exitCode"
+              }
+              'PASS: packaged AV1 probe exited 0 with system-only PATH' | Add-Content -Path $report
+              $output
+              Get-Content -LiteralPath $report
+            } finally {
+              Pop-Location
+            }
+          } finally {
+            $env:PATH = $oldPath
+          }
+
+      - name: Upload the probe package and result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-mingw-av1-smoke-${{ github.sha }}
+          path: build/av1-smoke/bin/
+          if-no-files-found: warn
+          retention-days: 7
