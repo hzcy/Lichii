@@ -157,9 +157,12 @@ add_library(
     net/net.h net/net.cpp
     container/unordered_map.h container/unordered_set.h)
 
+# The ZBIC decoder runs once per module at load, so a profile buys it nothing, and the aarch64
+# PGO build returns errors for NSOs the plain build decodes (#95). -fno-profile-instr-use is the
+# spelling both clang and clang-cl accept; it overrides -fprofile-use from CMAKE_CXX_FLAGS.
 set_source_files_properties(zbic_compression.cpp PROPERTIES
     INCLUDE_DIRECTORIES "${ZBIC_INCLUDE_DIR}"
-    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>")
+    COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:-Wno-unused-function;-Wno-missing-declarations;-Wno-shadow>;$<$<CXX_COMPILER_ID:MSVC>:/wd4505;/wd5245>;$<$<CXX_COMPILER_ID:AppleClang,Clang>:-fno-profile-instr-use>")
 
 if(WIN32)
     target_sources(common PRIVATE windows/timer_resolution.cpp
