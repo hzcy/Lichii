@@ -330,7 +330,7 @@ sudo pkgin install git cmake autoconf build-essential libusb-1 nasm gcc13
 
 ```sh
 BASE="git make autoconf libtool automake-wrapper jq patch"
-MINGW="qt6-base qt6-charts qt6-tools qt6-translations qt6-svg cmake toolchain clang python-pip openssl vulkan-memory-allocator vulkan-devel glslang boost fmt lz4 nlohmann-json zlib zstd enet opus libusb openssl SDL3"
+MINGW="qt6-base qt6-charts qt6-tools qt6-translations qt6-svg cmake toolchain clang python-pip openssl vulkan-memory-allocator vulkan-devel glslang boost fmt lz4 nlohmann-json zlib zstd enet opus libusb openssl SDL3 ffmpeg"
 # Either x86_64 or clang-aarch64 (Windows on ARM)
 packages="$BASE"
 for pkg in $MINGW; do
