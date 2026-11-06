@@ -54,6 +54,11 @@ public:
         return Pop<PopMode::Try>(t);
     }
 
+    [[nodiscard]] bool Empty() const noexcept {
+        return consumer.index.load(std::memory_order::acquire) ==
+               producer.index.load(std::memory_order::acquire);
+    }
+
     void PopWait(T& t) noexcept {
         Pop<PopMode::Wait>(t);
     }

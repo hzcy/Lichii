@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/thread.h"
 
 namespace Tegra {
 
@@ -341,6 +342,11 @@ public:
         return waiters;
     }
 
+    void SetWakeEvent(Common::Event* event) {
+        std::scoped_lock lk{mutex};
+        wake_event = event;
+    }
+
     void Add(const void* owner, u64 device_address, u32 value, u32 operation) {
         std::scoped_lock lk{mutex};
         std::erase_if(waiters, [owner](const Waiter& w) { return w.owner == owner; });
@@ -371,11 +377,18 @@ public:
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        Common::Event* to_wake = nullptr;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    to_wake = wake_event;
+                }
             }
+        }
+        if (to_wake != nullptr) {
+            to_wake->Set();
         }
     }
 
@@ -404,6 +417,7 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+    Common::Event* wake_event{};
 };
 
 } // namespace Tegra

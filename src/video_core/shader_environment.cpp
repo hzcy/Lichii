@@ -1246,10 +1246,23 @@ void SerializePipeline(std::span<const char> key, std::span<const GenericEnviron
     }
 }
 
+std::vector<FileEnvironment> DeserializePipelineEnvironments(std::ifstream& file) {
+    u32 num_envs{};
+    file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+    if (num_envs == 0) {
+        throw std::ios_base::failure("Pipeline cache record has no environments");
+    }
+    std::vector<FileEnvironment> envs(num_envs);
+    for (FileEnvironment& env : envs) {
+        env.Deserialize(file);
+    }
+    return envs;
+}
+
 void LoadPipelines(
     std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics) try {
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>, std::streampos> load_graphics) try {
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return;
@@ -1282,16 +1295,12 @@ void LoadPipelines(
         if (stop_loading.stop_requested()) {
             return;
         }
-        u32 num_envs{};
-        file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-        std::vector<FileEnvironment> envs(num_envs);
-        for (FileEnvironment& env : envs) {
-            env.Deserialize(file);
-        }
+        const auto record_position = file.tellg();
+        auto envs = DeserializePipelineEnvironments(file);
         if (envs.front().ShaderStage() == Shader::Stage::Compute) {
             load_compute(file, std::move(envs.front()));
         } else {
-            load_graphics(file, std::move(envs));
+            load_graphics(file, std::move(envs), std::streampos{record_position});
         }
     }
 

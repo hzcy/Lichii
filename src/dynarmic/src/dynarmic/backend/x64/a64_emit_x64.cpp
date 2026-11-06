@@ -559,6 +559,32 @@ void A64EmitX64::EmitA64GetCNTFRQ(A64EmitContext& ctx, IR::Inst* inst) {
 }
 
 void A64EmitX64::EmitA64GetCNTPCT(A64EmitContext& ctx, IR::Inst* inst) {
+    if (conf.wall_clock_cntpct && conf.inline_cntpct_tsc_factor != 0) {
+        const Xbyak::Reg64 rax_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
+        const Xbyak::Reg64 rdx_reg = ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
+        const Xbyak::Reg64 tmp = ctx.reg_alloc.ScratchGpr(code);
+        code.rdtsc();
+        code.shl(rdx_reg, 32);
+        code.or_(rax_reg, rdx_reg);
+        code.mov(tmp, conf.inline_cntpct_tsc_base);
+        code.sub(rax_reg, tmp);
+        code.mov(tmp, conf.inline_cntpct_tsc_factor);
+        code.mul(tmp);
+        if (conf.inline_cntpct_last_ptr != nullptr && conf.inline_cntpct_spin_ticks != 0) {
+            Xbyak::Label no_pause;
+            code.mov(tmp, reinterpret_cast<u64>(conf.inline_cntpct_last_ptr));
+            code.mov(rax_reg, rdx_reg);
+            code.sub(rax_reg, qword[tmp]);
+            code.mov(qword[tmp], rdx_reg);
+            code.cmp(rax_reg, conf.inline_cntpct_spin_ticks);
+            code.jae(no_pause);
+            code.pause();
+            code.pause();
+            code.L(no_pause);
+        }
+        ctx.reg_alloc.DefineValue(code, inst, rdx_reg);
+        return;
+    }
     ctx.reg_alloc.HostCall(code, inst);
     if (!conf.wall_clock_cntpct) {
         code.UpdateTicks();

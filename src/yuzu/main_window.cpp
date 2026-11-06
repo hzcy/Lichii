@@ -3618,6 +3618,7 @@ void MainWindow::OnConfigure() {
         QVector<u64> old_favorited_ids = std::move(UISettings::values.favorited_ids);
 
         Settings::values.disabled_addons.clear();
+        Settings::RestoreGlobalState(false);
 
         config = std::make_unique<QtConfig>();
         UISettings::values.reset_to_defaults = false;

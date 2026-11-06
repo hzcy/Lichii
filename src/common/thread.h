@@ -20,10 +20,16 @@ namespace Common {
 
 class Event {
 public:
+#ifdef _WIN32
+    ~Event();
+#endif
     void Set() {
         std::scoped_lock lk{mutex};
         if (!is_set) {
             is_set = true;
+#ifdef _WIN32
+            WakeTimedWaiters();
+#endif
             condvar.notify_one();
         }
     }
@@ -57,6 +63,11 @@ public:
     }
 
 private:
+#ifdef _WIN32
+    void WakeTimedWaiters();
+    bool WaitForWin32Fallback(std::chrono::nanoseconds time);
+    void* timed_wait_event{};
+#endif
     alignas(64) std::atomic<bool> is_set{false};
     std::condition_variable condvar;
     std::mutex mutex;

@@ -288,8 +288,11 @@ void SerializePipeline(const Key& key, const Envs& envs, const std::filesystem::
     SerializePipeline(std::span(reinterpret_cast<const char*>(&key), sizeof(key)), std::span(envs.data(), envs.size()), filename, cache_version);
 }
 
+/// Reads a record's environments, leaving the stream at the backend-specific pipeline key.
+std::vector<FileEnvironment> DeserializePipelineEnvironments(std::ifstream& file);
+
 void LoadPipelines(std::stop_token stop_loading, const std::filesystem::path& filename, u32 expected_cache_version,
     Common::UniqueFunction<void, std::ifstream&, FileEnvironment> load_compute,
-    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>> load_graphics);
+    Common::UniqueFunction<void, std::ifstream&, std::vector<FileEnvironment>, std::streampos> load_graphics);
 
 } // namespace VideoCommon

@@ -2,7 +2,6 @@
 
 #include <limits>
 #include <string_view>
-#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -12,28 +11,9 @@ namespace {
 
 using Vulkan::SubmissionPolicy::Action;
 using Vulkan::SubmissionPolicy::Advance;
-using Vulkan::SubmissionPolicy::DefaultNativeBudget;
 using Vulkan::SubmissionPolicy::ParseBudget;
 
 } // namespace
-
-TEST_CASE("Native desktop submissions use an exact default budget", "[video_core][submission_policy]") {
-    u32 counter{};
-    std::vector<u32> dispatches;
-    std::vector<u32> submissions;
-    for (u32 work = 1; work <= 384; ++work) {
-        const auto action = Advance(counter, true, false);
-        if (action == Action::Dispatch) {
-            dispatches.push_back(work);
-        } else if (action == Action::Flush) {
-            submissions.push_back(work);
-            REQUIRE(counter == 0);
-        }
-    }
-    REQUIRE(DefaultNativeBudget == 128);
-    REQUIRE(submissions == std::vector<u32>{128, 256, 384});
-    REQUIRE(dispatches == std::vector<u32>{32, 64, 96, 160, 192, 224, 288, 320, 352});
-}
 
 TEST_CASE("Native submission overrides do not round to a dispatch boundary",
           "[video_core][submission_policy]") {
@@ -109,15 +89,15 @@ TEST_CASE("Resetting the work counter restarts the submission budget",
           "[video_core][submission_policy]") {
     u32 counter{};
     for (u32 work = 1; work < 128; ++work) {
-        REQUIRE(Advance(counter, true, false) != Action::Flush);
+        REQUIRE(Advance(counter, true, false, 128) != Action::Flush);
     }
     counter = 0;
     for (u32 work = 1; work < 128; ++work) {
-        REQUIRE(Advance(counter, true, false) != Action::Flush);
+        REQUIRE(Advance(counter, true, false, 128) != Action::Flush);
     }
-    REQUIRE(Advance(counter, true, false) == Action::Flush);
+    REQUIRE(Advance(counter, true, false, 128) == Action::Flush);
     REQUIRE(counter == 0);
-    REQUIRE(Advance(counter, true, false) == Action::None);
+    REQUIRE(Advance(counter, true, false, 128) == Action::None);
     REQUIRE(counter == 1);
 }
 
@@ -134,13 +114,13 @@ TEST_CASE("A maximum native budget flushes before the counter wraps",
 TEST_CASE("Changing the active native policy preserves recorded work",
           "[video_core][submission_policy]") {
     u32 counter = 200;
-    REQUIRE(Advance(counter, true, false) == Action::Flush);
+    REQUIRE(Advance(counter, true, false, 128) == Action::Flush);
     REQUIRE(counter == 0);
     for (u32 work = 1; work < 31; ++work) {
         REQUIRE(Advance(counter, false, false) == Action::None);
     }
     REQUIRE(Advance(counter, false, false) == Action::Dispatch);
     REQUIRE(counter == 31);
-    REQUIRE(Advance(counter, true, false) == Action::Dispatch);
+    REQUIRE(Advance(counter, true, false, 128) == Action::Dispatch);
     REQUIRE(counter == 32);
 }

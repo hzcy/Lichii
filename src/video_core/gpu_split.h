@@ -163,8 +163,9 @@ public:
         last_writer_position = write_position;
     }
     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+    /// Includes writers after NoteSync; page-written flags are not authoritative before this wait.
     /// Returns whether any of it was still queued.
-    bool WaitForWriters();
+    bool WaitForWriters(DrainSite site = DrainSite::ListWriters);
     /// A host-level wait was just sent (a syncpoint acquire, a host WFI, a GP entry with its sync
     /// bit; semaphore acquires drain): the guest's GPU work before it is complete before the
     /// commands after it are fetched.
@@ -175,6 +176,27 @@ public:
     /// of it was still queued.
     bool WaitForSync();
 
+    /// Maps a guest semaphore address to its tracking slot in sem_write_positions.
+    static constexpr size_t SemSlot(u64 addr) noexcept {
+        return static_cast<size_t>(((addr >> 2) ^ (addr >> 10) ^ (addr >> 18)) & 63U);
+    }
+    /// Records the ring write position of a deferred GPU semaphore or query write.
+    void NoteSemaphoreWrite(u64 addr) noexcept {
+        sem_write_positions[SemSlot(addr)] = write_position;
+        last_release_position = write_position;
+    }
+    /// Records that a compute or DMA command capable of releasing guest memory was queued.
+    void NoteAnyRelease() noexcept {
+        last_release_position = write_position;
+    }
+    /// Returns the ring position of the most recent potential GPU release.
+    [[nodiscard]] u64 LastReleasePosition() const noexcept {
+        return last_release_position;
+    }
+    /// Waits until the back thread has executed any queued semaphore write to the slot of `addr`.
+    bool WaitForSemaphore(u64 addr, DrainSite site = DrainSite::Acquire) {
+        return WaitFor(sem_write_positions[SemSlot(addr)], site);
+    }
 private:
     friend struct GpuSplitTestAccess;
 
@@ -247,6 +269,8 @@ private:
     u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
+    u64 last_release_position{};
+    std::array<u64, 64> sem_write_positions{};
     u64 published_local{};
     u64 consumed_cache{};
     /// Words between publishes: small right after a drain, while the back has nothing to do.
@@ -262,6 +286,8 @@ private:
     void* idle_argument{};
     alignas(64) std::atomic<bool> hook_requested{};
     std::atomic<bool> back_running{};
+    /// True when no back thread is active or after BackLoop exits; cleared before thread launch.
+    std::atomic<bool> back_exited{true};
 
     // 128 bytes: x86 spatial prefetchers pull 64-byte lines in pairs. back_waiting and wake are
     // always touched together by both threads, so they share a block.
@@ -275,6 +301,8 @@ private:
     alignas(128) std::atomic<bool> front_waiting{};
     std::atomic<u32> front_wake{};
     std::jthread back_thread;
+    alignas(128) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
 };
 
 } // namespace VideoCommon

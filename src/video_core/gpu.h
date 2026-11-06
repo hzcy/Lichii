@@ -16,6 +16,9 @@
 #include "video_core/framebuffer_config.h"
 #include "video_core/rasterizer_download_area.h"
 
+namespace Common {
+class Event;
+}
 namespace Core {
 class System;
 } // namespace Core
@@ -224,6 +227,9 @@ public:
 
     /// Whether a channel is suspended on a semaphore acquire (callable from any thread).
     [[nodiscard]] bool HasSuspendedChannels() const;
+    [[nodiscard]] bool IsIdleOnPendingSemaphore() const;
+    void SetPendingIdleWake(const std::shared_ptr<Common::Event>& event);
+    void WakePendingChannels();
 
     [[nodiscard]] bool UseNvdec() const;
 

@@ -89,6 +89,7 @@ private:
 
     std::mutex guard;
     u64 last_action_id{};
+    std::atomic<u64> pending_waiters{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

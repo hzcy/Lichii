@@ -536,6 +536,18 @@ bool GPU::HasSuspendedChannels() const {
     return impl->scheduler.HasPendingChannelsAnyThread();
 }
 
+bool GPU::IsIdleOnPendingSemaphore() const {
+    return impl->gpu_thread.IsIdleOnPendingSemaphore();
+}
+
+void GPU::SetPendingIdleWake(const std::shared_ptr<Common::Event>& event) {
+    impl->gpu_thread.SetPendingIdleWake(event);
+}
+
+void GPU::WakePendingChannels() {
+    impl->gpu_thread.WakePending();
+}
+
 bool GPU::UseNvdec() const {
     return impl->use_nvdec;
 }

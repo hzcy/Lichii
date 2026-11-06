@@ -1773,13 +1773,6 @@ private:
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
-            // With EDEN_NX2_FRAMES_AHEAD=1, only run a frame ahead while the GPU keeps up. With
-            // the previous frame still on the GPU here, the GPU is the limit and running ahead
-            // gains nothing; and Splatoon Raiders, which reuses its command memory as if the GPU
-            // were at most a frame behind, rewrote command lists Eden had not read yet (misread
-            // commands, then crashes, with a slow GPU). Wait for this frame too then. Not when a
-            // suspended channel brought us here: this frame can't finish before the present
-            // returns.
             const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
@@ -1862,6 +1855,7 @@ private:
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+        system.GPU().WakePendingChannels();
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -1981,36 +1975,36 @@ private:
         // command buffers ahead misses the equal-value gates its other channels acquire.
         const auto deadline = start + std::chrono::milliseconds{4000};
         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
-            // Woken by the GPU thread as it reaches the fence. Polling with 200 us sleeps slept
-            // about 1 ms per check on Windows, added to every frame. An action left registered
-            // after a timeout fires later on a state nobody waits on.
+            if (unless_gpu_waits && system.GPU().IsIdleOnPendingSemaphore()) {
+                return false;
+            }
             struct Wake {
-                std::mutex mutex;
-                std::condition_variable cv;
-                bool done{};
+                std::shared_ptr<Common::Event> event = std::make_shared<Common::Event>();
+                std::atomic<bool> done{};
             };
             auto wake = std::make_shared<Wake>();
+            if (unless_gpu_waits) {
+                system.GPU().SetPendingIdleWake(wake->event);
+            }
             syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
-                {
-                    std::scoped_lock lk{wake->mutex};
-                    wake->done = true;
-                }
-                wake->cv.notify_all();
+                wake->done.store(true, std::memory_order_release);
+                wake->event->Set();
             });
-            std::unique_lock lk{wake->mutex};
-            // Title 1's channels resume and suspend again while they wait on this thread, so any
-            // suspension counts, not only an unbroken one.
             bool gpu_waited = false;
-            while (!wake->done && system.IsPoweredOn() &&
+            while (!wake->done.load(std::memory_order_acquire) && system.IsPoweredOn() &&
                    std::chrono::steady_clock::now() < deadline) {
                 if (unless_gpu_waits) {
+                    if (system.GPU().IsIdleOnPendingSemaphore()) {
+                        return false;
+                    }
                     gpu_waited |= system.GPU().HasSuspendedChannels();
                     if (gpu_waited &&
                         std::chrono::steady_clock::now() - start > std::chrono::milliseconds{3}) {
                         return false;
                     }
                 }
-                wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
+                wake->event->WaitFor(unless_gpu_waits ? std::chrono::microseconds{250}
+                                                      : std::chrono::milliseconds{50});
             }
         }
         if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {

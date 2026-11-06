@@ -27,7 +27,7 @@ public:
     void Push(GPU& gpu, s32 channel, CommandList&& entries);
 
     /// Runs channels whose pending semaphore acquire is now met.
-    void ResumePending(GPU& gpu);
+    bool ResumePending(GPU& gpu);
     [[nodiscard]] bool HasPendingChannels() const {
         return !pending_channels.empty();
     }

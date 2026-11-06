@@ -54,32 +54,33 @@ constexpr std::array PreferredGpuDecoders = {
 };
 
 AVPixelFormat GetGpuFormat(AVCodecContext* codec_context, const AVPixelFormat* pix_fmts) {
-    const auto desc = av_pix_fmt_desc_get(codec_context->pix_fmt);
-    if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+    if (codec_context->hw_device_ctx) {
+        const auto* hw_ctx =
+            reinterpret_cast<const AVHWDeviceContext*>(codec_context->hw_device_ctx->data);
         for (int i = 0;; i++) {
             const AVCodecHWConfig* config = avcodec_get_hw_config(codec_context->codec, i);
             if (!config) {
                 break;
             }
-
-            for (const auto type : PreferredGpuDecoders) {
-                if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type) {
-                    codec_context->pix_fmt = config->pix_fmt;
+            if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+                config->device_type == hw_ctx->type) {
+                for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+                    if (*p == config->pix_fmt) {
+                        return *p;
+                    }
                 }
             }
         }
     }
 
-    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
-        if (*p == codec_context->pix_fmt) {
-            return codec_context->pix_fmt;
-        }
-    }
-
     LOG_INFO(HW_GPU, "Could not find supported GPU pixel format, falling back to CPU decoder");
     av_buffer_unref(&codec_context->hw_device_ctx);
-    codec_context->pix_fmt = PreferredCpuFormat;
-    return codec_context->pix_fmt;
+    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == PreferredCpuFormat) {
+            return *p;
+        }
+    }
+    return pix_fmts[0];
 }
 
 std::string AVError(int errnum) {
@@ -154,7 +155,7 @@ Frame::~Frame() {
     av_frame_free(&m_frame);
 }
 
-Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
+Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec, bool prefer_hw) {
     const AVCodecID av_codec = [&] {
         switch (codec) {
         case Tegra::Host1x::NvdecCommon::VideoCodec::H264:
@@ -172,7 +173,7 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     }();
 
 #if defined(__ANDROID__)
-    if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
+    if (prefer_hw) {
         const char* mc_name = nullptr;
         switch (av_codec) {
         case AV_CODEC_ID_H264: mc_name = "h264_mediacodec"; break;
@@ -184,6 +185,10 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
         if (mc_name) {
             m_codec = avcodec_find_decoder_by_name(mc_name);
         }
+    }
+#else
+    if (prefer_hw && av_codec == AV_CODEC_ID_AV1) {
+        m_codec = avcodec_find_decoder_by_name("av1");
     }
 #endif
     if (!m_codec) {
@@ -295,10 +300,10 @@ DecoderContext::~DecoderContext() {
     avcodec_free_context(&m_codec_context);
 }
 
-void DecoderContext::InitializeHardwareDecoder(const HardwareContext& context, AVPixelFormat hw_pix_fmt) {
+void DecoderContext::InitializeHardwareDecoder(const HardwareContext& context,
+                                               [[maybe_unused]] AVPixelFormat hw_pix_fmt) {
     m_codec_context->hw_device_ctx = av_buffer_ref(context.GetBufferRef());
     m_codec_context->get_format = GetGpuFormat;
-    m_codec_context->pix_fmt = hw_pix_fmt;
 }
 
 bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> extradata) {
@@ -325,8 +330,11 @@ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> ext
 }
 
 bool DecoderContext::SendPacket(const Packet& packet) {
-    if (const int ret = avcodec_send_packet(m_codec_context, packet.GetPacket()); ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
+    m_had_decode_error = false;
+    if (const int ret = avcodec_send_packet(m_codec_context, packet.GetPacket());
+        ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
         LOG_ERROR(HW_GPU, "avcodec_send_packet error: {}", AVError(ret));
+        m_had_decode_error = true;
         return false;
     }
 
@@ -334,28 +342,36 @@ bool DecoderContext::SendPacket(const Packet& packet) {
 }
 
 std::shared_ptr<Frame> DecoderContext::ReceiveFrame() {
+    m_had_decode_error = false;
     auto ReceiveImpl = [&](AVFrame* frame) -> int {
         const int ret = avcodec_receive_frame(m_codec_context, frame);
         if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EAGAIN)) {
             LOG_ERROR(HW_GPU, "avcodec_receive_frame error: {}", AVError(ret));
+            m_had_decode_error = true;
         }
         return ret;
     };
 
-    std::shared_ptr<Frame> intermediate_frame = std::make_shared<Frame>();
-    if (ReceiveImpl(intermediate_frame->GetFrame()) < 0) {
+    if (!m_temp_frame) {
+        m_temp_frame = std::make_shared<Frame>();
+    } else {
+        av_frame_unref(m_temp_frame->GetFrame());
+    }
+    if (ReceiveImpl(m_temp_frame->GetFrame()) < 0) {
         return {};
     }
 
-    m_final_frame = std::make_shared<Frame>();
     if (m_codec_context->hw_device_ctx) {
+        m_final_frame = std::make_shared<Frame>();
         m_final_frame->SetFormat(PreferredGpuFormat);
-        if (const int ret = av_hwframe_transfer_data(m_final_frame->GetFrame(), intermediate_frame->GetFrame(), 0); ret < 0) {
+        if (const int ret = av_hwframe_transfer_data(m_final_frame->GetFrame(), m_temp_frame->GetFrame(), 0); ret < 0) {
             LOG_ERROR(HW_GPU, "av_hwframe_transfer_data error: {}", AVError(ret));
+            m_had_decode_error = true;
             return {};
         }
+        av_frame_copy_props(m_final_frame->GetFrame(), m_temp_frame->GetFrame());
     } else {
-        m_final_frame = std::move(intermediate_frame);
+        m_final_frame = std::exchange(m_temp_frame, std::make_shared<Frame>());
     }
 
     return std::move(m_final_frame);
@@ -376,7 +392,8 @@ void DecodeApi::Reset() {
 
 bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     this->Reset();
-    m_decoder.emplace(codec);
+    m_decoder.emplace(codec,
+                      Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu);
     m_decoder_context.emplace(*m_decoder);
 
     bool is_mediacodec = false;
@@ -391,7 +408,12 @@ bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     if (!is_mediacodec &&
         Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
         m_hardware_context.emplace();
-        m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder);
+        if (!m_hardware_context->InitializeForDecoder(*m_decoder_context, *m_decoder)) {
+            m_decoder_context.reset();
+            m_hardware_context.reset();
+            m_decoder.emplace(codec, false);
+            m_decoder_context.emplace(*m_decoder);
+        }
     }
 
 #if defined(__ANDROID__)

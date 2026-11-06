@@ -921,12 +921,19 @@ void Config::ReadSettingGeneric(Settings::BasicSetting* const setting) {
     }
 
     if (global || !use_global) {
+        const bool restore_custom = global && setting->Switchable() && !setting->UsingGlobal();
+        if (restore_custom) {
+            setting->SetGlobal(true);
+        }
         const bool is_default = ReadBooleanSetting(std::string(key).append("\\default"), std::make_optional(true));
         if (!is_default) {
             setting->LoadString(ReadStringSetting(key, default_value));
         } else {
             // Empty string resets the Setting to default
             setting->LoadString("");
+        }
+        if (restore_custom) {
+            setting->SetGlobal(false);
         }
     }
 }

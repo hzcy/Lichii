@@ -119,6 +119,7 @@ public:
     void RequestOutsideRenderPassOperationContext(
         std::source_location location = std::source_location::current());
 
+    /// Defers a fragment barrier until a subsequent draw in the active render pass depends on it.
     void DeferFragmentBarrier() {
         fragment_barrier.Defer(state.renderpass != VK_NULL_HANDLE);
     }

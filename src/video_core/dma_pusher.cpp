@@ -130,6 +130,12 @@ bool DmaPusher::Step() {
         if (fetch_drain && g_nx2_ampere.load(std::memory_order_relaxed)) {
             VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::FetchDrain);
         }
+        // A queued writer may not have marked its destination pages yet. Execute all queued
+        // writers before consulting that bitmap or fetching command words, including writers
+        // queued after the last host sync.
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.WaitForWriters();
+        }
         bool gpu_written = IsGpuWrittenCommands(dma_state.dma_get,
                                                  size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
@@ -185,11 +191,6 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
-        }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
                                command_list.snapshot_suspensions ==
@@ -299,6 +300,25 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             dma_state.is_last_call = true;
             index += max_write;
         } else if (dma_state.method_count) {
+            constexpr u32 cb_data =
+                offsetof(Engines::Maxwell3D::Regs, const_buffer.buffer) / sizeof(u32);
+            if (!dma_state.non_incrementing && !dma_increment_once &&
+                dma_state.method >= cb_data && dma_state.method < cb_data + 16 &&
+                subchannel_type[dma_state.subchannel] == Engines::EngineTypes::Maxwell3D &&
+                subchannels[dma_state.subchannel] != nullptr && g_semaphore_watch == 0) {
+                const u32 batch = static_cast<u32>((std::min<size_t>)(
+                    {size_t{dma_state.method_count}, commands.size() - index,
+                     size_t{cb_data + 16 - dma_state.method}}));
+                if (batch > 1) {
+                    dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
+                    CallMultiMethod(&commands[index].argument, batch);
+                    dma_state.method += batch;
+                    dma_state.method_count -= batch;
+                    dma_state.is_last_call = true;
+                    index += batch;
+                    continue;
+                }
+            }
             // Fast-path batching for consecutive non-execution methods in increasing mode
             if (!dma_state.non_incrementing && !dma_increment_once &&
                 dma_state.method >= non_puller_methods &&
@@ -329,11 +349,16 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             auto const command_header = commands[index]; //can copy
             dma_state.dma_word_offset = u64((word_offset + index) * sizeof(u32));
             dma_state.is_last_call = dma_state.method_count <= 1;
+            const u32 called_method = dma_state.method;
             CallMethod(command_header.argument);
-            dma_state.method += !dma_state.non_incrementing ? 1 : 0;
+            dma_state.method += static_cast<u32>(!dma_state.non_incrementing);
             dma_state.non_incrementing |= dma_increment_once;
             dma_state.method_count--;
             index++;
+            if (called_method < non_puller_methods && puller.HasPendingAcquire()) {
+                return index;
+            }
+            continue;
         } else {
             auto const command_header = commands[index]; //can copy
             // No command active - this is the first word of a new one
@@ -366,7 +391,7 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             }
             index++;
         }
-        if (puller.HasPendingAcquire()) {
+        if (dma_state.method < non_puller_methods && puller.HasPendingAcquire()) {
             return index;
         }
     }
@@ -459,11 +484,15 @@ void DmaPusher::CallMethod(u32 argument) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        const bool writer = (engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA) &&
+                            (dma_state.method >= MacroRegistersStart ||
+                             (dma_state.method < subchannel->execution_mask.size() &&
+                              subchannel->execution_mask[dma_state.method]));
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                split.NoteAnyRelease();
             }
         };
         if (split.Active()) {
@@ -518,11 +547,23 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
         }
         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
         const auto engine_type = subchannel_type[dma_state.subchannel];
-        const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
-                            engine_type == Engines::EngineTypes::MaxwellDMA;
+        bool writer = false;
+        if (engine_type == Engines::EngineTypes::KeplerCompute ||
+            engine_type == Engines::EngineTypes::MaxwellDMA) {
+            const u32 check_count = dma_state.non_incrementing ? 1U : num_methods;
+            for (u32 i = 0; i < check_count; ++i) {
+                const u32 m = dma_state.method + i;
+                if (m >= MacroRegistersStart ||
+                    (m < subchannel->execution_mask.size() && subchannel->execution_mask[m])) {
+                    writer = true;
+                    break;
+                }
+            }
+        }
         SCOPE_EXIT {
             if (writer) {
                 split.NoteWriter();
+                split.NoteAnyRelease();
             }
         };
         if (split.Active()) {

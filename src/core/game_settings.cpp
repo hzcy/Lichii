@@ -119,12 +119,70 @@ EnvironmentInfo DetectEnvironment(const VideoCore::RendererBase& renderer) {
     return env;
 }
 
+void LoadEarlyOverrides(std::uint64_t program_id) {
+    const auto os = DetectOS();
+    switch (static_cast<TitleID>(program_id)) {
+        case TitleID::OcarinaOfTime:
+            if (Settings::values.gpu_accuracy.UsingGlobal()) {
+                Settings::values.gpu_accuracy.SetGlobal(false);
+                Settings::values.gpu_accuracy.SetValue(Settings::GpuAccuracy::Low);
+            }
+            if (Settings::values.use_asynchronous_shaders.UsingGlobal()) {
+                Settings::values.use_asynchronous_shaders.SetGlobal(false);
+                Settings::values.use_asynchronous_shaders.SetValue(true);
+            }
+            if (Settings::values.use_reactive_flushing.UsingGlobal()) {
+                Settings::values.use_reactive_flushing.SetGlobal(false);
+                Settings::values.use_reactive_flushing.SetValue(false);
+            }
+            if (Settings::values.cpu_accuracy.UsingGlobal()) {
+                Settings::values.cpu_accuracy.SetGlobal(false);
+                Settings::values.cpu_accuracy.SetValue(Settings::CpuAccuracy::Unsafe);
+            }
+            if (Settings::values.game_dlss_network.UsingGlobal()) {
+                Settings::values.game_dlss_network.SetGlobal(false);
+                Settings::values.game_dlss_network.SetValue(false);
+            }
+            if (Settings::values.nvidia_dlss.UsingGlobal()) {
+                Settings::values.nvidia_dlss.SetGlobal(false);
+                Settings::values.nvidia_dlss.SetValue(false);
+            }
+            if (Settings::values.nvdec_emulation.UsingGlobal() && os != OS::Android) {
+                Settings::values.nvdec_emulation.SetGlobal(false);
+                Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Gpu);
+            }
+            if (Settings::values.async_presentation.UsingGlobal()) {
+                Settings::values.async_presentation.SetGlobal(false);
+                Settings::values.async_presentation.SetValue(true);
+            }
+            if (Settings::values.skip_cpu_inner_invalidation.UsingGlobal()) {
+                Settings::values.skip_cpu_inner_invalidation.SetGlobal(false);
+                Settings::values.skip_cpu_inner_invalidation.SetValue(true);
+            }
+            if (Settings::values.vsync_mode.UsingGlobal() &&
+                Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Fifo) {
+                Settings::values.vsync_mode.SetGlobal(false);
+                Settings::values.vsync_mode.SetValue(Settings::VSyncMode::Mailbox);
+            }
+            if (Settings::values.cpu_clock.UsingGlobal()) {
+                Settings::values.cpu_clock.SetGlobal(false);
+                Settings::values.cpu_clock.SetValue(Settings::CpuClock::Normal);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 void LoadOverrides(std::uint64_t program_id, const VideoCore::RendererBase& renderer) {
     const auto env = DetectEnvironment(renderer);
 
     switch (static_cast<TitleID>(program_id)) {
         case TitleID::NinjaGaidenRagebound:
             Settings::values.use_squashed_iterated_blend = true;
+            break;
+        case TitleID::OcarinaOfTime:
+            LoadEarlyOverrides(program_id);
             break;
         default:
             break;

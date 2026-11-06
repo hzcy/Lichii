@@ -136,6 +136,27 @@ public:
         cached_pages.clear();
     }
 
+    [[nodiscard]] bool HasPendingCpuUpload(VAddr query_cpu_addr, u64 query_size) const noexcept {
+        if (query_size == 0) {
+            return false;
+        }
+        std::size_t remaining_size{query_size};
+        std::size_t page_index{query_cpu_addr >> HIGHER_PAGE_BITS};
+        u64 page_offset{query_cpu_addr & HIGHER_PAGE_MASK};
+        while (remaining_size > 0) {
+            const std::size_t copy_amount{
+                (std::min<std::size_t>)(HIGHER_PAGE_SIZE - page_offset, remaining_size)};
+            const Manager* const manager{top_tier[page_index]};
+            if (manager == nullptr || manager->HasPendingUpload()) {
+                return true;
+            }
+            page_index++;
+            page_offset = 0;
+            remaining_size -= copy_amount;
+        }
+        return false;
+    }
+
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
     template <typename Func>
     void ForEachUploadRange(VAddr query_cpu_range, u64 query_size, Func&& func) {

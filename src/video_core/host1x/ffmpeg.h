@@ -133,7 +133,7 @@ public:
     YUZU_NON_COPYABLE(Decoder);
     YUZU_NON_MOVEABLE(Decoder);
 
-    explicit Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec);
+    explicit Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec, bool prefer_hw = false);
     ~Decoder() = default;
 
     bool SupportsDecodingOnDevice(AVPixelFormat* out_pix_fmt, AVHWDeviceType type) const;
@@ -191,11 +191,18 @@ public:
         return m_decode_order;
     }
 
+    /// Returns true if the last SendPacket or ReceiveFrame encountered a non-EAGAIN/EOF error.
+    [[nodiscard]] bool HadDecodeError() const noexcept {
+        return m_had_decode_error;
+    }
+
 private:
     const Decoder& m_decoder;
     AVCodecContext* m_codec_context{};
     std::shared_ptr<Frame> m_final_frame{};
+    std::shared_ptr<Frame> m_temp_frame{};
     bool m_decode_order{};
+    bool m_had_decode_error{};
 };
 
 struct FrameOffsets {
