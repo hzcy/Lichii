@@ -517,6 +517,25 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         first_next = &diagnostics_nv;
     }
 
+    // AMD's own drivers refuse allocations past the device heap even with the system heap free:
+    // an RX 5500M (3 GB budget) in Ocarina of Time got VK_ERROR_OUT_OF_DEVICE_MEMORY for images
+    // and buffers in every memory type, the system heap at 318 of 7206 MiB, and aborted
+    // (Eglantine#161: the same on an RX 9060 XT). Allow over-allocation so Windows pages instead.
+    // EDEN_NX2_AMD_OVERALLOCATION=0 keeps the driver's default.
+    VkDeviceMemoryOverallocationCreateInfoAMD overallocation{};
+    if (extensions.memory_overallocation_behavior) {
+        const char* const value = std::getenv("EDEN_NX2_AMD_OVERALLOCATION");
+        if (value == nullptr || value[0] != '0') {
+            overallocation = {
+                .sType = VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD,
+                .pNext = first_next,
+                .overallocationBehavior = VK_MEMORY_OVERALLOCATION_BEHAVIOR_ALLOWED_AMD,
+            };
+            first_next = &overallocation;
+            LOG_INFO(Render_Vulkan, "AMD memory over-allocation allowed");
+        }
+    }
+
     is_blit_depth24_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D24_UNORM_S8_UINT);
     is_blit_depth32_stencil8_supported = TestDepthStencilBlits(VK_FORMAT_D32_SFLOAT_S8_UINT);
     is_optimal_astc_supported = ComputeIsOptimalAstcSupported();

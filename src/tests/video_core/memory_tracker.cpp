@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <memory>
 #include <stdexcept>
 #include "common/container/unordered_map.h"
 #include <tuple>
 #include <vector>
 #include <optional>
+#include <random>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -702,6 +704,78 @@ TEST_CASE("MemoryTracker: cached writes preserve tracking counts") {
     REQUIRE(memory_track->IsRegionCpuModified(c + PAGE * 4, PAGE));
     memory_track->MarkRegionAsCpuModified(c, WORD * 2);
     REQUIRE(rasterizer.Count() == 0);
+}
+
+TEST_CASE("MemoryTracker: synchronized range forgets overlapping CPU writes", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    memory_track->ForEachUploadRange(c, PAGE * 4, [](u64, u64) {});
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->MarkRegionAsCpuModified(c + PAGE * 4, PAGE);
+    memory_track->MarkRegionAsGpuModified(c, PAGE);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->MarkRegionAsCpuModified(c + PAGE * 3, 1);
+    REQUIRE(!memory_track->IsSynchronized(3));
+
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    memory_track->CachedCpuWrite(c + PAGE * 6, PAGE);
+    REQUIRE(memory_track->IsSynchronized(3));
+    memory_track->FlushCachedWrites();
+    REQUIRE(!memory_track->IsSynchronized(3));
+
+    memory_track->WatchSynchronized(3, c, PAGE * 4);
+    memory_track->ForgetSynchronized(3);
+    REQUIRE(!memory_track->IsSynchronized(3));
+}
+
+TEST_CASE("MemoryTracker: a synchronized range has nothing to upload", "[video_core]") {
+    RasterizerInterface rasterizer;
+    std::optional<MemoryTracker> memory_track(rasterizer);
+    std::mt19937 rng{20261104};
+    const auto random_range = [&]() -> Range {
+        const u64 begin = c + (rng() % 120) * PAGE + (rng() % 2) * 100;
+        return {begin, 1 + rng() % (PAGE * 8)};
+    };
+    std::array<Range, 4> watched{};
+    for (int step = 0; step < 20000; ++step) {
+        const auto [addr, size] = random_range();
+        switch (rng() % 7) {
+        case 0:
+            memory_track->MarkRegionAsCpuModified(addr, size);
+            break;
+        case 1:
+            memory_track->CachedCpuWrite(addr, size);
+            break;
+        case 2:
+            memory_track->FlushCachedWrites();
+            break;
+        case 3:
+            memory_track->MarkRegionAsGpuModified(addr, size);
+            break;
+        case 4:
+            memory_track->UnmarkRegionAsCpuModified(addr, size);
+            break;
+        default: {
+            const u32 slot = rng() % 4;
+            memory_track->ForEachUploadRange(addr, size, [](u64, u64) {});
+            memory_track->WatchSynchronized(slot, addr, size);
+            watched[slot] = {addr, size};
+            break;
+        }
+        }
+        for (u32 slot = 0; slot < 4; ++slot) {
+            if (!memory_track->IsSynchronized(slot)) {
+                continue;
+            }
+            const size_t calls = rasterizer.UpdateCallsList().size();
+            int uploads = 0;
+            memory_track->ForEachUploadRange(watched[slot].first, watched[slot].second,
+                                             [&](u64, u64) { ++uploads; });
+            REQUIRE(uploads == 0);
+            REQUIRE(rasterizer.UpdateCallsList().size() == calls);
+        }
+    }
 }
 
 TEST_CASE("DeviceMemoryManager: UpdatePagesCachedBatch basic") {

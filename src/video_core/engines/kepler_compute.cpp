@@ -35,6 +35,7 @@
 #include "video_core/macro_turing_jit.h"
 #endif
 #include "video_core/rasterizer_interface.h"
+#include "video_core/texture_cache/texture_cache_base.h"
 #include "video_core/textures/decoders.h"
 
 namespace Tegra::Engines {

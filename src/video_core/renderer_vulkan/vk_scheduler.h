@@ -28,6 +28,7 @@
 #include "video_core/gpu_wait_site.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_parallel_record.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 namespace VideoCommon {
@@ -146,6 +147,16 @@ public:
     /// Returns true when a render pass is currently active in the scheduler state.
     bool IsRenderPassActive() const {
         return state.renderpass != VK_NULL_HANDLE;
+    }
+
+    /// Changes whenever a render pass begins or ends.
+    u64 RenderPassSerial() const {
+        return render_pass_serial;
+    }
+
+    /// The graphics pipeline bound in the current command buffer, if the scheduler knows it.
+    const GraphicsPipeline* BoundGraphicsPipeline() const {
+        return state.graphics_pipeline;
     }
 
     /// Update the pipeline to the current execution context.
@@ -452,6 +463,7 @@ private:
     std::unique_ptr<MasterSemaphore> master_semaphore;
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    u64 render_pass_serial{};
     bool graphics_pipeline_missing{};
     std::unique_ptr<CommandPool> command_pool;
 
@@ -518,6 +530,8 @@ private:
     std::mutex queue_mutex;
     std::condition_variable_any event_cv;
     bool worker_waiting{}; ///< The worker is waiting for work (guarded by queue_mutex)
+    std::unique_ptr<ParallelRecord::SecondarySource> secondary_pools;
+    std::unique_ptr<ParallelRecord> parallel_record; ///< EDEN_NX2_PARALLEL_RECORD, worker only
     std::jthread worker_thread;
 
     std::chrono::steady_clock::duration frame_interval{};

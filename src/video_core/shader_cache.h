@@ -77,6 +77,19 @@ public:
     /// @brief Flushes delayed removal operations
     void SyncGuestHost();
 
+    /// EDEN_NX2_INLINE_INVALIDATE: changes whenever a shader or a rejected program is remembered.
+    [[nodiscard]] u64 PageSerial() const noexcept {
+        return page_serial.load(std::memory_order_acquire);
+    }
+
+    /// The page serial when no shader or rejected program is in [addr, addr + size), else 0.
+    [[nodiscard]] u64 CleanSerial(VAddr addr, size_t size);
+
+    /// Whether invalidated shaders wait for RemovePendingShaders.
+    [[nodiscard]] bool HasPendingRemovals() const noexcept {
+        return removal_pending.load(std::memory_order_acquire);
+    }
+
     /// Drops the native programs the debug server rejects so their next draw or dispatch lowers
     /// them again (and fails); after an un-reject, forgets every rejection so they are retried.
     /// Runs on the thread that owns the cache, between frames.
@@ -182,6 +195,8 @@ private:
     /// Bounds of every address ever rejected (never shrinks): a quick test for invalidations.
     std::atomic<VAddr> rejected_lowest{~VAddr{}};
     std::atomic<VAddr> rejected_highest{};
+    std::atomic<u64> page_serial{1};
+    std::atomic<bool> removal_pending{};
 };
 
 } // namespace VideoCommon

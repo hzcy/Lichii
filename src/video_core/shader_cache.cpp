@@ -24,6 +24,7 @@
 #include "shader_recompiler/object_pool.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
+#include "video_core/nx2_fast_draw.h"
 #include "video_core/dlss_contract.h"
 #include "video_core/fire_emblem_upscale.h"
 #include "video_core/engines/kepler_compute.h"
@@ -326,6 +327,7 @@ void ShaderCache::RememberRejection(VAddr addr) {
                           std::memory_order_relaxed);
     rejected_highest.store((std::max)(rejected_highest.load(std::memory_order_relaxed), addr),
                            std::memory_order_relaxed);
+    page_serial.fetch_add(1, std::memory_order_release);
 }
 
 void ShaderCache::GetGraphicsEnvironments(GraphicsEnvironments& result,
@@ -373,8 +375,29 @@ void ShaderCache::Register(std::unique_ptr<ShaderInfo> data, VAddr addr, size_t 
     }
 
     storage.push_back(std::move(data));
+    page_serial.fetch_add(1, std::memory_order_release);
 
     device_memory.UpdatePagesCachedCount(addr, size, 1);
+}
+
+u64 ShaderCache::CleanSerial(VAddr addr, size_t size) {
+    std::scoped_lock lock{invalidation_mutex};
+    const VAddr addr_end = addr + size;
+    if (addr_end > rejected_lowest.load(std::memory_order_relaxed) &&
+        addr <= rejected_highest.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const u64 page_end = (addr_end + YUZU_PAGESIZE - 1) >> YUZU_PAGEBITS;
+    for (u64 page = addr >> YUZU_PAGEBITS; page < page_end; ++page) {
+        const auto it = invalidation_cache.find(page);
+        if (it != invalidation_cache.end() &&
+            std::ranges::any_of(it->second, [&](const Entry* entry) {
+                return entry->Overlaps(addr, addr_end);
+            })) {
+            return 0;
+        }
+    }
+    return page_serial.load(std::memory_order_relaxed);
 }
 
 void ShaderCache::InvalidatePagesInRegion(VAddr addr, size_t size) {
@@ -416,8 +439,10 @@ void ShaderCache::RemovePendingShaders() {
         lookup_cache.erase(it);
     }
     marked_for_removal.clear();
+    removal_pending.store(false, std::memory_order_release);
 
     if (!removed_shaders.empty()) {
+        Nx2FastDraw::Break(Nx2FastDraw::Reason::Invalidation);
         if (removed_shaders.size() > 16) {
             std::ranges::sort(removed_shaders, std::less<ShaderInfo*>{});
             std::erase_if(storage, [&removed_shaders](const std::unique_ptr<ShaderInfo>& shader) {
@@ -444,6 +469,7 @@ void ShaderCache::InvalidatePageEntries(std::vector<Entry*>& entries, VAddr addr
         UnmarkMemory(entry);
         RemoveEntryFromInvalidationCache(entry);
         marked_for_removal.push_back(entry);
+        removal_pending.store(true, std::memory_order_release);
     }
 }
 

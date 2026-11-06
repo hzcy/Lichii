@@ -12,6 +12,7 @@
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/sw_blitter/blitter.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_draw_runs.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/surface.h"
 #include "video_core/textures/decoders.h"
@@ -62,6 +63,9 @@ void Fermi2D::ConsumeSinkImpl(Core::System& system) {
 }
 
 void Fermi2D::Blit() {
+    if (VideoCommon::Nx2DrawRuns::g_enabled) [[unlikely]] {
+        VideoCommon::Nx2DrawRuns::OnBreak(VideoCommon::Nx2DrawRuns::Break::Copy);
+    }
     if (static const u64 trace_destination = [] {
             const char* value = std::getenv("EDEN_NX2_TRACE_DST");
             return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;

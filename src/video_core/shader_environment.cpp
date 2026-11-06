@@ -58,6 +58,16 @@ static u64 NativeShaderHash(std::span<const u64> code) {
            0x4f554e4345000002ULL;
 }
 
+bool RejectedByHash(u64 hash) {
+    static const std::string list = [] {
+        const char* text = std::getenv("EDEN_NX2_REJECT_HASH");
+        std::string value = text ? "," + std::string{text} + "," : std::string{};
+        std::ranges::transform(value, value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value;
+    }();
+    return !list.empty() && list.find(fmt::format(",{:016x},", hash)) != std::string::npos;
+}
+
 static u64 MakeCbufKey(u32 index, u32 offset) {
     return (static_cast<u64>(index) << 32) | offset;
 }
@@ -703,18 +713,10 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
     // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by native program key (shader
     // dump file names) or shader hash (frame dump "shaders"), which stay the same between runs.
-    if (static const std::string reject_hashes = [] {
-            const char* text = std::getenv("EDEN_NX2_REJECT_HASH");
-            std::string list = text ? "," + std::string{text} + "," : std::string{};
-            std::ranges::transform(list, list.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            return list;
-        }();
-        !reject_hashes.empty()) {
-        for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
-            if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
-                throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
-                                           program_base, hash);
-            }
+    for (const u64 hash : {result->native_program_key, NativeShaderHash(lowered_code)}) {
+        if (RejectedByHash(hash)) {
+            throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
+                                       program_base, hash);
         }
     }
     // The same list, changed at runtime by the debug server (docs/nx2/debug-mcp.md).
@@ -1244,6 +1246,13 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
+    // A record damaged on disk (the drive filled up while the cache was written) asked for
+    // gigabytes here and threw std::bad_alloc, which LoadPipelines did not catch. Fail it as a
+    // read error so the cache is deleted and rebuilt.
+    constexpr u64 max_code_size = 64ULL << 20;
+    if (code_size > max_code_size) {
+        throw std::ios_base::failure("Pipeline cache record with an implausible code size");
+    }
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
     for (size_t i = 0; i < num_texture_types; ++i) {
@@ -1498,8 +1507,10 @@ void LoadPipelines(
         }
     }
 
-} catch (const std::ios_base::failure& e) {
-    LOG_ERROR(Common_Filesystem, "{}", e.what());
+} catch (const std::exception& e) {
+    // A read error, or a damaged record that asked for more memory than exists: the file is
+    // corrupt, so delete it and let the pipelines be built again.
+    LOG_ERROR(Common_Filesystem, "Corrupt pipeline cache, deleting it: {}", e.what());
     if (!Common::FS::RemoveFile(filename)) {
         LOG_ERROR(Common_Filesystem, "Failed to delete pipeline cache file {}",
                   Common::FS::PathToUTF8String(filename));

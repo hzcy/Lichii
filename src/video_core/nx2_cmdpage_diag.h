@@ -191,8 +191,9 @@ inline void CheckMissedWrite(u64 page_addr, u32 begin, u32 end) {
     }
 }
 
-/// The front's macro read `words` at `source` after draining (MME DMA): `changed` of them differ
-/// from guest memory read before the drain; `gpu_written`: on pages GPU work has written.
+/// The front's macro read `words` at `source` (MME DMA): `changed` of them differ between the
+/// read after waiting for memory writers and the last sync and the read after a full drain;
+/// `gpu_written`: on pages GPU work has written.
 inline void RecordDmaRead(u64 source, u32 words, u32 changed, bool gpu_written) {
     State& state = Get();
     state.dma_reads.fetch_add(1, std::memory_order_relaxed);

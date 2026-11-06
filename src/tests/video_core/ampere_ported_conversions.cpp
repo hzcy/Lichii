@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <catch2/catch_test_macros.hpp>
@@ -101,7 +102,7 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
         invalid[0].words = {0x00157d05, source, 0x0821e100, 0x0001e400};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
     }
-    for (const u32 source : {0x00400440U, 0x04800400U, 0x40400400U, 0x80400400U}) {
+    for (const u32 source : {0x00400440U, 0x04800400U}) {
         auto invalid = code;
         invalid[0].words = {0x00157b05, source, 0x0021e100, 0x0001e400};
         REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
@@ -119,6 +120,29 @@ TEST_CASE("Ampere byte F2I rejects other widths, rounding, modifiers and registe
     invalid[0].words[0] = 0x00f67305;
     REQUIRE_FALSE(static_cast<bool>(LowerToMaxwell(invalid)));
 }
+TEST_CASE("Ampere F2I applies abs and neg to constant-buffer sources", "[video_core][ampere]") {
+    // nvdisasm: bit 62 prints |c[..]| and bit 63 -c[..] for the byte, U16 and TRUNC word forms.
+    for (const u32 mode : {0x0021e100U, 0x00212800U, 0x0021f100U}) {
+        for (const u32 modifiers : {1U, 2U, 3U}) {
+            const std::array<Instruction, 2> code{{
+                {{0x00157b05, 0x00400400 | (modifiers << 30), mode, 0x0001e400}},
+                {{0x0000794d, 0, 0x03800000, 0}},
+            }};
+            const auto lowered = LowerToMaxwell(code);
+            INFO(lowered.error);
+            REQUIRE(lowered);
+            const auto& out = lowered.instructions;
+            const auto has = [&](u64 instruction) {
+                return std::find(out.begin(), out.end(), instruction) != out.end();
+            };
+            CHECK(has(0x0400000000070000ULL | 252 | (252ULL << 8) | (0x7fffffffULL << 20)) ==
+                  ((modifiers & 1) != 0));
+            CHECK(has(0x0400000000070000ULL | 252 | (252ULL << 8) | (0x80000000ULL << 20) |
+                      (2ULL << 53)) == ((modifiers & 2) != 0));
+        }
+    }
+}
+
 TEST_CASE("Ampere ceiling F2I preserves rounding, signedness and unsigned saturation",
           "[video_core][ampere]") {
     for (const bool is_signed : {false, true}) {

@@ -206,6 +206,50 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
+VkResult MemoryAllocator::CreateInAnyMemoryType(
+    std::string_view what, u64 size, bool host_visible,
+    const std::function<VkResult(const VmaAllocationCreateInfo&)>& create) const {
+    // On an RX 5500M (Ocarina of Time), VMA's host-preferring retry failed with the system heap
+    // at 318 of 7206 MiB: try each type by hand and log why each one fails.
+    static std::atomic<u32> logged{};
+    const bool log = logged.fetch_add(1, std::memory_order_relaxed) < 3;
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    for (const bool device_local_heaps : {false, true}) {
+        for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+            const VkMemoryType& memory_type = properties.memoryTypes[type];
+            const bool local_heap = (properties.memoryHeaps[memory_type.heapIndex].flags &
+                                     VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            if (local_heap != device_local_heaps || ((valid_memory_types >> type) & 1) == 0 ||
+                (host_visible &&
+                 (memory_type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)) {
+                continue;
+            }
+            const VmaAllocationCreateInfo type_ci{
+                .flags = host_visible ? VMA_ALLOCATION_CREATE_MAPPED_BIT : VmaAllocationCreateFlags{},
+                .usage = VMA_MEMORY_USAGE_UNKNOWN,
+                .requiredFlags = 0,
+                .preferredFlags = 0,
+                .memoryTypeBits = 1u << type,
+                .pool = VK_NULL_HANDLE,
+                .pUserData = nullptr,
+                .priority = 0.f,
+            };
+            result = create(type_ci);
+            if (log) {
+                LOG_WARNING(Render_Vulkan, "{} of {} KiB in memory type {} (heap {}, flags {:#x}): {}",
+                            what, size >> 10, type, memory_type.heapIndex,
+                            static_cast<u32>(memory_type.propertyFlags), static_cast<int>(result));
+            }
+            if (result == VK_SUCCESS) {
+                return result;
+            }
+        }
+    }
+    // Types the resource cannot use answer VK_ERROR_FEATURE_NOT_PRESENT; the caller's fallbacks
+    // (an unbacked sparse image) expect out of memory.
+    return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
@@ -244,6 +288,10 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         "budget; allocating it anyway",
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
+            // The first times: what the heaps hold when the budget runs out.
+            if (logged <= 2) {
+                LogMemoryStatistics(device);
+            }
         }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
         VmaAllocationCreateInfo relaxed = alloc_ci;
@@ -267,6 +315,13 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
     }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        result = CreateInAnyMemoryType(
+            "Image (~4 bytes per texel)", texels * 4, false,
+            [&](const VmaAllocationCreateInfo& type_ci) {
+                return vmaCreateImage(allocator, &ci, &type_ci, &handle, &allocation, &alloc_info);
+            });
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
         if (!huge) {
             pressure_events.fetch_add(1, std::memory_order_relaxed);
@@ -280,6 +335,11 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
                         "unbacked sparse image",
                         ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                         ci.arrayLayers, static_cast<u32>(ci.format));
+            // What filled memory (once a session, a few times): heap usage against budget.
+            static std::atomic<u32> reported{};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 2) {
+                LogMemoryStatistics(device);
+            }
             return sparse;
         }
     }
@@ -424,7 +484,55 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     VkMemoryPropertyFlags property_flags{};
 
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
-        vk::Check(vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info));
+        VkResult result =
+            vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // Over the device memory budget. As for images (CreateImage) and commits: go past
+            // it, then to host memory, instead of aborting the GPU thread. An RX 5500M (3 GB) in
+            // Ocarina of Time crashed here on a buffer cache buffer and on a texture download's
+            // staging buffer once gameplay filled the card.
+            pressure_events.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged{};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+                LOG_WARNING(Render_Vulkan,
+                            "Buffer of {} KiB (usage {}) is over the memory budget; allocating it "
+                            "anyway",
+                            ci.size >> 10, static_cast<u32>(usage));
+                LogMemoryStatistics(device);
+            }
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+            if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                relaxed.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                relaxed.preferredFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+                result =
+                    vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+                if (result == VK_SUCCESS) {
+                    static std::atomic<u32> host_logged{};
+                    if (host_logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "Buffer of {} KiB is out of device memory; placed in host "
+                                    "memory",
+                                    ci.size >> 10);
+                    }
+                }
+            }
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            result = CreateInAnyMemoryType("Buffer", ci.size, usage != MemoryUsage::DeviceLocal,
+                                           [&](const VmaAllocationCreateInfo& type_ci) {
+                                               return vmaCreateBuffer(allocator, &ci, &type_ci,
+                                                                      &handle, &allocation,
+                                                                      &alloc_info);
+                                           });
+        }
+        if (result != VK_SUCCESS) {
+            LOG_CRITICAL(Render_Vulkan, "Buffer of {} KiB (usage {}) failed: {}", ci.size >> 10,
+                         static_cast<u32>(usage), static_cast<int>(result));
+            LogMemoryStatistics(device);
+        }
+        vk::Check(result);
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
 

@@ -129,6 +129,9 @@ public:
         write_tick = write_tick_;
     }
 
+    /// The frame tick of the last LRU touch (EDEN_NX2_BUFFER_SKIP).
+    u64 touch_tick = ~u64{0};
+
 private:
     VAddr cpu_addr = 0;
     BufferFlagBits flags{};

@@ -30,6 +30,9 @@ class Memorymanager;
 
 namespace VideoCommon {
 
+/// EDEN_NX2_REJECT_HASH=<hash>,...: whether a native program key or shader hash is listed.
+[[nodiscard]] bool RejectedByHash(u64 hash);
+
 /// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
 /// it so the environments built for the program's pipelines don't capture and lower it again.
 struct LoweredNativeCode {

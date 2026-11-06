@@ -1618,6 +1618,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::unique_ptr<EmissionBudget::Reservation> reservation, const AsyncBuildContext* async) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+    // Pipelines from the disk cache are not lowered again, so the list is checked here too.
+    for (const u64 stage_hash : key.unique_hashes) {
+        if (stage_hash != 0 && VideoCommon::RejectedByHash(stage_hash)) {
+            LOG_WARNING(Render_Vulkan, "Pipeline {:016x}: shader {:016x} rejected by EDEN_NX2_REJECT_HASH",
+                        hash, stage_hash);
+            return nullptr;
+        }
+    }
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
@@ -1833,6 +1841,28 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 }
 
 namespace {
+// Whether compute programs with software HMMA (emulated tensor-core matrix multiplies) are built.
+// Ocarina of Time's upscaling network has hundreds per program: host drivers take minutes on each
+// (AMD's then fail with VK_ERROR_OUT_OF_HOST_MEMORY), so it is rejected and
+// KeplerCompute::UpscaleInsteadOfNativeProgram draws in its place, as Eglantine does. Checked after
+// translation so programs from the disk cache are rejected too. EDEN_NX2_TENSOR=1 emulates it
+// anyway, EDEN_NX2_TENSOR=0 rejects it for every title, and a list of shader hashes emulates only
+// those (Ocarina's gameplay network without its intro ones).
+bool EmulatesSoftwareMatrix(u64 shader_hash) {
+    static const std::string forced = [] {
+        const char* value = std::getenv("EDEN_NX2_TENSOR");
+        return value ? std::string{value} : std::string{};
+    }();
+    if (forced == "1" || forced == "0") {
+        return forced == "1";
+    }
+    if (!forced.empty()) {
+        return ("," + forced + ",").find(fmt::format(",{:016x},", shader_hash)) != std::string::npos;
+    }
+    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+    return Settings::GetCurrentProgramID() != OcarinaOfTimeProgramId;
+}
+
 // Pipelines built on the GPU thread at run time (shader translation, and the SPIR-V unless a worker
 // emits it; the driver compile is on workers): the first 400 over 2 ms and every one over 100 ms
 // are logged, and the totals every 10 s, to tell how much of the stutter on new content is
@@ -1874,7 +1904,20 @@ void ReportRuntimePipeline(const char* kind, std::chrono::steady_clock::time_poi
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     const auto begin = std::chrono::steady_clock::now();
+    // EDEN_NX2_PIPE_TRACE: the runtime path. A pipeline that never returns from here spins a core
+    // inside codegen, so the begin line without its end line names the shader pair to look at.
+    static const bool pipe_trace = std::getenv("EDEN_NX2_PIPE_TRACE") != nullptr;
+    if (pipe_trace) {
+        LOG_ERROR(Render_Vulkan, "RT PIPE begin vs={:016x} ps={:016x}",
+                  graphics_key.unique_hashes[0], graphics_key.unique_hashes[1]);
+    }
     SCOPE_EXIT {
+        if (pipe_trace) {
+            LOG_ERROR(Render_Vulkan, "RT PIPE end vs={:016x} ps={:016x} ms={:.1f}",
+                      graphics_key.unique_hashes[0], graphics_key.unique_hashes[1],
+                      std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - begin).count());
+        }
         std::string shaders = fmt::format("pipeline={:016x}", graphics_key.Hash());
         for (size_t stage = 0; stage < graphics_key.unique_hashes.size(); ++stage) {
             if (graphics_key.unique_hashes[stage] != 0) {
@@ -2238,6 +2281,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    if (program.info.uses_software_matrix && !EmulatesSoftwareMatrix(key.unique_hash)) {
+        return {.failure = "native matrix multiply is not emulated for this title (set "
+                           "EDEN_NX2_TENSOR=1 to emulate)"};
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
@@ -2275,11 +2322,15 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         const auto name{fmt::format("Shader {:016x}", key.unique_hash)};
         spv_module.SetObjectNameEXT(name.c_str());
     }
-    Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    const bool deferred = program.info.uses_software_matrix &&
+                          device.DefersSoftwareMatrixPipelines();
+    Common::ThreadWorker* const thread_worker{deferred            ? &deferred_workers
+                                              : build_in_parallel ? &workers
+                                                                  : nullptr};
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
                 descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash)};
+                std::move(spv_module), key.unique_hash, deferred)};
 
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "Compute pipeline compilation failed shader={:#016x} pipeline={:#016x}: {}",

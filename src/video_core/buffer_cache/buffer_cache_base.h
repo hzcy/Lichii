@@ -260,6 +260,9 @@ public:
 
     void DownloadMemory(DAddr device_addr, u64 size);
 
+    /// DownloadMemory for each range, waiting for the GPU once.
+    void DownloadMemoryRanges(std::span<const std::pair<DAddr, u64>> ranges);
+
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
@@ -432,6 +435,18 @@ public:
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectCount();
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
+
+    /// EDEN_NX2_FAST_DRAW: updates and binds only the index buffer for a reused indexed draw.
+    /// False when that created or deleted buffers, so the draw needs a full resolve.
+    [[nodiscard]] bool RebindIndexBuffer();
+    /// Updates and binds the vertex buffers whose registers changed; false when that created or
+    /// deleted buffers.
+    [[nodiscard]] bool RebindVertexBuffers();
+    /// Resolves the graphics uniform, storage and texture buffers bound since the last draw;
+    /// false when that created or deleted buffers.
+    [[nodiscard]] bool UpdateGraphicsStageBuffers();
+    /// EDEN_NX2_FAST_DRAW_VERIFY: a hash of the bindings a reused or delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
 
     template <typename Func>
     void BufferOperations(Func&& func) {
@@ -632,6 +647,27 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// EDEN_NX2_BUFFER_SKIP: the inputs and result of each vertex stream's last lookup.
+    struct VertexLookup {
+        GPUVAddr begin{};
+        GPUVAddr end{};
+        const void* owner{};
+        u64 map_serial{};
+        u64 deletions{};
+        Binding binding{};
+        bool valid{};
+    };
+    std::array<VertexLookup, NUM_VERTEX_BUFFERS> vertex_lookups{};
+    u64 buffer_deletions = 0;
+    struct SkipStats {
+        u64 window_start{};
+        u64 lookups{};
+        u64 lookups_kept{};
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+    } skip_stats;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 

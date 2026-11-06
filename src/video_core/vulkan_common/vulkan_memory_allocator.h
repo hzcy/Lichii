@@ -7,9 +7,11 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -152,6 +154,13 @@ namespace Vulkan {
         MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
 
     private:
+        /// Last resort once VMA's own choice of memory type fails: tries every memory type
+        /// explicitly, those outside device-local heaps first, and logs each result the first
+        /// few times. host_visible restricts it to mappable types.
+        VkResult CreateInAnyMemoryType(
+            std::string_view what, u64 size, bool host_visible,
+            const std::function<VkResult(const VmaAllocationCreateInfo&)>& create) const;
+
         static bool IsAutoUsage(VmaMemoryUsage u) noexcept {
             switch (u) {
                 case VMA_MEMORY_USAGE_AUTO:

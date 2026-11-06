@@ -1112,6 +1112,7 @@ void MemoryManager::FlushCaching() {
     if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
         GetSubmappedRangeImpl<false>(addr, size, page_stash2);
     })) {
+        VideoCommon::Nx2FastDraw::NoteInvalidation();
         rasterizer->InnerInvalidation(page_stash2);
         page_stash2.clear();
     }

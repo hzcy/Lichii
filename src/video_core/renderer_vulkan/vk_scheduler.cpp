@@ -38,6 +38,23 @@
 namespace Vulkan {
 
 namespace {
+class SecondaryPools final : public ParallelRecord::SecondarySource {
+public:
+    explicit SecondaryPools(MasterSemaphore& master_semaphore, const Device& device, u32 threads) {
+        for (u32 thread = 0; thread < threads; ++thread) {
+            pools.push_back(std::make_unique<CommandPool>(master_semaphore, device,
+                                                          VK_COMMAND_BUFFER_LEVEL_SECONDARY));
+        }
+    }
+
+    VkCommandBuffer Acquire(u32 thread) override {
+        return pools[thread]->Commit();
+    }
+
+private:
+    std::vector<std::unique_ptr<CommandPool>> pools;
+};
+
 std::atomic<u64> g_profile_submits{};
 std::atomic<u64> g_profile_renderpasses{};
 std::atomic<u64> g_profile_finishes{};
@@ -147,6 +164,15 @@ Scheduler::Scheduler(const Device& device_, StateTracker& state_tracker_)
         }
     }
 
+    if (const u32 threads = ParallelRecord::ThreadsFromEnv(); threads != 0) {
+        if (device.GetDispatchLoader().vkCmdExecuteCommands == nullptr) {
+            LOG_WARNING(Render_Vulkan, "EDEN_NX2_PARALLEL_RECORD ignored: no vkCmdExecuteCommands");
+        } else {
+            secondary_pools = std::make_unique<SecondaryPools>(*master_semaphore, device, threads);
+            parallel_record = std::make_unique<ParallelRecord>(device.GetDispatchLoader(), threads,
+                                                               *secondary_pools);
+        }
+    }
     AcquireNewChunk();
     AllocateWorkerCommandBuffer();
     worker_thread = std::jthread([this](std::stop_token token) { WorkerThread(token); });
@@ -339,6 +365,7 @@ void Scheduler::BeginRenderPassImpl(const Framebuffer* framebuffer, VkRenderPass
     }
     const VkFramebuffer framebuffer_handle = framebuffer->Handle();
     const VkExtent2D render_area = framebuffer->RenderArea();
+    ++render_pass_serial;
     state.renderpass = renderpass;
     state.framebuffer = framebuffer_handle;
     state.render_area = render_area;
@@ -560,11 +587,16 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            work->ExecuteAll(parallel_record ? parallel_record->Wrap(*current_cmdbuf)
+                                             : current_cmdbuf,
+                             current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
+                if (parallel_record) {
+                    parallel_record->BeginPrimary();
+                }
             }
         }
 
@@ -897,6 +929,7 @@ void Scheduler::EndRenderPass()
         ++recording_epoch;
         fragment_barrier.Reset();
         render_pass_has_stores = false;
+        ++render_pass_serial;
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 

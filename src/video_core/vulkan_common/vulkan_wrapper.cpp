@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -19,6 +22,13 @@
 namespace Vulkan::vk {
 
 namespace {
+
+struct TemplateSize {
+    std::size_t size;
+    VkPipelineBindPoint bind_point;
+};
+std::shared_mutex template_sizes_mutex;
+std::unordered_map<VkDescriptorUpdateTemplate, TemplateSize> template_sizes;
 
 template <typename Func>
 void SortPhysicalDevices(std::vector<VkPhysicalDevice>& devices, const InstanceDispatch& dld,
@@ -120,6 +130,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdEndConditionalRenderingEXT);
     X(vkCmdEndQuery);
     X(vkCmdEndRenderPass);
+    X(vkCmdExecuteCommands);
     X(vkCmdEndTransformFeedbackEXT);
     X(vkCmdEndDebugUtilsLabelEXT);
     X(vkCmdFillBuffer);
@@ -809,10 +820,38 @@ CommandPool Device::CreateCommandPool(const VkCommandPoolCreateInfo& ci) const {
     return CommandPool(object, handle, *dld);
 }
 
+std::size_t DescriptorUpdateTemplateDataSize(VkDescriptorUpdateTemplate update_template,
+                                             VkPipelineBindPoint& bind_point) {
+    std::shared_lock lock{template_sizes_mutex};
+    const auto it = template_sizes.find(update_template);
+    if (it == template_sizes.end()) {
+        return 0;
+    }
+    bind_point = it->second.bind_point;
+    return it->second.size;
+}
+
 DescriptorUpdateTemplate Device::CreateDescriptorUpdateTemplate(
     const VkDescriptorUpdateTemplateCreateInfo& ci) const {
     VkDescriptorUpdateTemplate object;
     Check(dld->vkCreateDescriptorUpdateTemplate(handle, &ci, nullptr, &object));
+    std::size_t size = 0;
+    for (u32 i = 0; i < ci.descriptorUpdateEntryCount; ++i) {
+        const VkDescriptorUpdateTemplateEntry& entry = ci.pDescriptorUpdateEntries[i];
+        if (entry.descriptorCount != 0) {
+            const std::size_t count = entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+                                          ? 1
+                                          : entry.descriptorCount;
+            const std::size_t element = entry.descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+                                            ? entry.descriptorCount
+                                            : entry.stride;
+            size = std::max(size, entry.offset + entry.stride * (count - 1) + element);
+        }
+    }
+    {
+        std::scoped_lock lock{template_sizes_mutex};
+        template_sizes[object] = {size, ci.pipelineBindPoint};
+    }
     return DescriptorUpdateTemplate(object, handle, *dld);
 }
 
