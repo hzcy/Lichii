@@ -1323,6 +1323,7 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
     // the memory tracker, leaving stale host contents, so upload such a bank again once per frame.
+    // Copied directly: marking it CPU-modified unprotected and reprotected its pages each frame.
     if (has_host_buffer && (*channel_state->uniform_buffer_sizes)[stage][index] == 0x10000 &&
         size != 0 && gpu_memory != nullptr && gpu_memory->UsesNativeTiling() &&
         (Nx2Perf::Verify() || !native_indirect_uniforms_this_frame.contains(device_addr)) &&
@@ -1334,8 +1335,14 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
                device_memory.template GetPointer<u8>(device_addr + mapped_size) != nullptr) {
             mapped_size += Core::DEVICE_PAGESIZE - ((device_addr + mapped_size) & Core::DEVICE_PAGEMASK);
         }
-        if (mapped_size != 0) {
-            memory_tracker.MarkRegionAsCpuModified(device_addr, (std::min<u64>)(mapped_size, size));
+        const u64 upload_size = (std::min<u64>)(mapped_size, size);
+        if (upload_size != 0) {
+            std::array<BufferCopy, 1> copies{BufferCopy{
+                .src_offset = 0,
+                .dst_offset = buffer.Offset(device_addr),
+                .size = upload_size,
+            }};
+            UploadMemory(buffer, upload_size, upload_size, copies);
         }
     }
     const bool use_fast_buffer = needs_alignment_stream
