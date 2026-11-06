@@ -29,10 +29,15 @@ public:
     explicit UsageTracker(size_t size) {
         const size_t num_pages = (size >> BUFFER_PAGE_SHIFT) + 1;
         pages.resize(num_pages, 0ULL);
+        full_blocks.resize((num_pages >> BLOCK_SHIFT) / 64 + 1, 0ULL);
     }
 
     void Reset() noexcept {
+        if (!touched) {
+            return;
+        }
         std::ranges::fill(pages, 0ULL);
+        std::ranges::fill(full_blocks, 0ULL);
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -48,6 +53,7 @@ public:
             }
         }
         recent[recent_cursor++ % recent.size()] = {offset, size};
+        touched = true;
         const size_t page = offset >> BUFFER_PAGE_SHIFT;
         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
         if (page_end < page || page_end >= pages.size()) {
@@ -73,7 +79,7 @@ public:
             return true;
         }
         for (size_t i = page + 1; i < page_end; i++) {
-            if (pages[i] != 0) {
+            if (pages[i] != 0 || IsBlockFull(i >> BLOCK_SHIFT)) {
                 return true;
             }
         }
@@ -138,11 +144,14 @@ private:
         const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
         const size_t mask = ~u64{0} >> (64 - num_bits);
         const size_t mask2 = (~u64{0} & mask) << first_bit;
-        return (pages[page] & mask2) != 0;
+        return (pages[page] & mask2) != 0 || (mask2 != 0 && IsBlockFull(page >> BLOCK_SHIFT));
     }
 
 private:
     std::vector<u64> pages;
+    std::vector<u64> full_blocks;
+    /// Whether anything was tracked since the last Reset.
+    bool touched{};
     /// Ranges tracked last, (offset, size).
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
