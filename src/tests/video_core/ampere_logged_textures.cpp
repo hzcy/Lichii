@@ -27,6 +27,7 @@ constexpr std::array<Instruction, 2> Gathers{{
 class TextureEnvironment final : public Shader::Environment {
 public:
     u32 binding{15};
+    bool integer_format{false};
     std::span<const u64> code;
 
     TextureEnvironment() { stage = Shader::Stage::Compute; }
@@ -45,7 +46,9 @@ public:
     Shader::TexturePixelFormat ReadTexturePixelFormat(u32) override {
         return Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
-    bool IsTexturePixelFormatInteger(u32) override { return false; }
+    bool IsTexturePixelFormatInteger(u32) override {
+        return integer_format;
+    }
     u32 ReadViewportTransformState() override { return 1; }
     u32 TextureBoundBuffer() const override { return binding; }
     u32 LocalMemorySize() const override { return 0; }
@@ -243,6 +246,30 @@ TEST_CASE("Welcome Tour array depth samples preserve alternate descriptor banks"
         CHECK(count == 3);
         CHECK(bindings == std::array<u32, 3>{first_binding, 4, 4});
     }
+}
+
+TEST_CASE("Depth-compare samples keep a float image when the descriptor reads as integer",
+          "[video_core][ampere][logged_textures]") {
+    // Ocarina of Time binds a garbage TIC (unknown format 33) to a TEX.DC; an integer sampled
+    // type made RADV's spirv_to_nir reject the module and crash.
+    const Instruction captured{{0x0a0d7b60, 0xb1012400, 0x041e41ff, 0x00114400}};
+    const auto lowered{Shader::Ampere::LowerToMaxwell(std::array{captured, Exit})};
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    TextureTranslation translated;
+    translated.env.binding = 4;
+    translated.env.integer_format = true;
+    translated.Translate(lowered, 7);
+    IR::Program program;
+    program.blocks = {&translated.block};
+    program.post_order_blocks = {&translated.block};
+    Shader::Optimization::SsaRewritePass(program);
+    Shader::HostTranslateInfo host;
+    host.ApplyDescriptorLimitPolicy();
+    Shader::Optimization::TexturePass(translated.env, program, host);
+    REQUIRE(program.info.texture_descriptors.size() == 1);
+    CHECK(program.info.texture_descriptors.front().is_depth);
+    CHECK_FALSE(program.info.texture_descriptors.front().is_integer);
 }
 
 TEST_CASE("Welcome Tour logged half fetch writes odd scalar destinations",
