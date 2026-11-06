@@ -147,6 +147,44 @@ static IPSwitchRecord EscapeStringSequences(std::string_view sv) {
     return r;
 }
 
+static bool IsHexString(std::string_view sv) {
+    return !sv.empty() && std::all_of(sv.cbegin(), sv.cend(), [](char c) {
+        return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+    });
+}
+
+// A record is a hex offset followed by a quoted string or a hex value.
+static bool IsPatchRecord(std::string_view line) {
+    const auto offset_end = line.find_first_of(" \t\"'");
+    if (offset_end == std::string_view::npos) {
+        return false;
+    }
+    auto offset = line.substr(0, offset_end);
+    if (offset.starts_with("0x") || offset.starts_with("0X")) {
+        offset.remove_prefix(2);
+    }
+    if (!IsHexString(offset)) {
+        return false;
+    }
+    const auto value_start = line.find_first_not_of(" \t", offset_end);
+    if (value_start == std::string_view::npos) {
+        return false;
+    }
+    const auto value = line.substr(value_start);
+    if (value[0] == '"' || value[0] == '\'') {
+        // The closing quote must end the line, as comments are already stripped.
+        for (size_t i = 1; i < value.size(); ++i) {
+            if (value[i] == '\\') {
+                ++i;
+            } else if (value[i] == value[0]) {
+                return i + 1 == value.size();
+            }
+        }
+        return false;
+    }
+    return value.find_first_not_of("0123456789abcdefABCDEF \t") == std::string_view::npos;
+}
+
 void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
     LOG_INFO(Loader, "IPSwitchCompiler: '{}'", patch_text->GetName());
     bool is_little_endian = true;
@@ -203,6 +241,9 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             }
         } else if (patches.empty()) {
             LOG_WARNING(Loader, "Invalid line not in a patch {}", line);
+        } else if (!IsPatchRecord(line)) {
+            // Text after a patch, such as credits, must not be written into the module.
+            LOG_WARNING(Loader, "Ignoring line that is not a patch {}", line);
         } else {
             size_t offset = size_t(std::strtoul(line.data(), nullptr, 16));
             offset += size_t(offset_shift);
@@ -267,7 +308,11 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
                 || (!quote && p[0] == '#')) {
                     break;
                 } else if (p[0] == '\"' || p[0] == '\'') {
-                    quote = (p[0] == quote) ? '\0' : p[0];
+                    if (!quote) {
+                        quote = p[0];
+                    } else if (p[0] == quote) {
+                        quote = '\0';
+                    }
                     ++p;
                     last_char = p;
                 } else if (p + 1 < sline.cend() && p[0] == '\\') {
