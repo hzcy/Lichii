@@ -18,6 +18,7 @@
 #include "common/math_util.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "shader_recompiler/exception.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -398,6 +399,13 @@ void RasterizerOpenGL::DispatchCompute() {
     gpu_memory->FlushCaching();
     ComputePipeline* const pipeline{shader_cache.CurrentComputePipeline()};
     if (!pipeline) {
+        // Native mode comes from the command stream (ChannelState::Init), not from the renderer,
+        // so a rejected program reaches this path here too. Report it as a failed dispatch like
+        // Vulkan does: KeplerCompute::DispatchNativeCompute treats a silent return as a skipped,
+        // successful dispatch.
+        if (kepler_compute->IsNativeMode()) {
+            throw Shader::RuntimeError("Native compute pipeline unavailable");
+        }
         return;
     }
     if (pipeline->UsesLocalMemory()) {
