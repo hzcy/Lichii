@@ -90,6 +90,7 @@ public:
 
     /// @returns Number of slots used
     [[nodiscard]] inline std::size_t Size() const {
+        std::lock_guard lock(rb_mutex);
         return write_index - read_index;
     }
 
@@ -103,7 +104,7 @@ private:
     // This is wrong, a thread-safe ringbuffer is impossible.
     std::size_t read_index{0};
     std::size_t write_index{0};
-    std::mutex rb_mutex;
+    mutable std::mutex rb_mutex;
 };
 
 } // namespace Common

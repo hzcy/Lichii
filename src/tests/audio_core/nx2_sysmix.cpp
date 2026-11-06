@@ -323,6 +323,9 @@ TEST_CASE("sysmix child lifetime retains registry after user session closes", "[
     context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 200;
     context.system.CoreTiming().Advance();
     REQUIRE(output->GetCounters().admitted_blocks == 1);
+    // Drain the silent block, so the empty ring underruns again instead of waiting on the host.
+    std::array<s16, 480> drained{};
+    context.sink.last->ProcessAudioOutAndRender(drained, 240);
     context.system.CoreTiming().cpu_ticks += Common::WallClock::CPUTickFreq / 10;
     context.system.CoreTiming().Advance();
     REQUIRE(output->GetCounters().ticks == 2);

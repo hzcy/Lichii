@@ -29,6 +29,7 @@ struct SysmixOutputCounters {
     u64 nonzero_frames{};
     u64 admitted_blocks{};
     u64 backpressure{};
+    u64 deferred{};
     u64 faults{};
 };
 

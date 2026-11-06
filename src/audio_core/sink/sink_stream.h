@@ -172,6 +172,14 @@ public:
     }
 
     /**
+     * Whether the host still has audio to play: queued buffers or the rest of the one playing.
+     * GetQueueSize drops to zero as soon as the last buffer starts, while its frames still play.
+     */
+    bool HasPendingAudio() const {
+        return samples_buffer.Size() != 0;
+    }
+
+    /**
      * Set the maximum buffer queue size.
      */
     void SetRingSize(u32 ring_size) {

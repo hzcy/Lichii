@@ -286,6 +286,16 @@ void SysmixOutput::Pump() {
         return;
     }
     const u32 taken = std::min(filled, BlockFrames);
+    // A short block is padded with silence. That is right for a real underrun, but while the host
+    // still has audio to play the guest is only a little behind this tick, and padding would cut a
+    // gap into continuous audio. Wait for a whole block until the host drains, so a guest that
+    // waits on fewer than BlockFrames frames (a high notification threshold) still makes progress.
+    // The queue size alone is not enough: it is zero while the last block is still playing.
+    if (taken < BlockFrames && p.host->HasPendingAudio()) {
+        ++p.counters.deferred;
+        p.Notify(filled);
+        return;
+    }
     const u32 first = std::min(taken, p.slots - read);
     const u32 second = taken - first;
     auto& memory = p.process->GetMemory();
