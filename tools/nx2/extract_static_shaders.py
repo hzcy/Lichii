@@ -10,43 +10,49 @@ from pathlib import Path
 import re
 import sys
 
-from shader_archive import ArchiveError, find_bnsh, parse_bnsh, parse_sarc
-from shader_containers import MAX_ALLOCATION, dcx_decompress, parse_bnd4, parse_cgsb, parse_shn, zstd_decompress
+from shader_archive import ArchiveError, find_bnsh, find_embedded_bnsh, parse_bnsh, parse_sarc
+from shader_containers import MAX_ALLOCATION, dcx_decompress, parse_bnd4, parse_cgsb, parse_sharcb, parse_shn, read_zstd_dictionaries, zstd_decompress
 
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def walk_container(data, name, depth=0):
+def walk_container(data, name, depth=0, dictionaries=None):
+    """Yield shader records and member errors from a supported container."""
     if depth > 12:
         raise ArchiveError("excessive container nesting")
     magic = data[:4]
     if magic == bytes.fromhex("28b52ffd"):
-        yield from walk_container(zstd_decompress(data), name + "!zstd", depth + 1)
+        yield from walk_container(zstd_decompress(data, dictionaries), name + "!zstd", depth + 1, dictionaries)
     elif magic == b"DCX\0":
-        yield from walk_container(dcx_decompress(data), name + "!dcx", depth + 1)
+        yield from walk_container(dcx_decompress(data), name + "!dcx", depth + 1, dictionaries)
     elif magic in (b"SARC", b"BND4"):
         members = parse_sarc(data) if magic == b"SARC" else parse_bnd4(data)
         for member, payload in members:
             try:
-                yield from walk_container(payload, name + "!" + member, depth + 1)
+                yield from walk_container(payload, name + "!" + member, depth + 1, dictionaries)
             except (ArchiveError, ValueError) as exc:
                 yield {"member": name + "!" + member, "error": str(exc)}
     elif magic == b"FSHA":
         for offset, bnsh in find_bnsh(data):
-            yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1)
-    elif magic in (b"BNSH", b"CGSB", b"SHN!"):
-        parser = {b"BNSH": parse_bnsh, b"CGSB": parse_cgsb, b"SHN!": parse_shn}[magic]
+            yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1, dictionaries)
+    elif magic == b"YB\x05\x00" and name.lower().endswith(
+            (".vsetb.byml", ".vsetb.byml.zs!zstd")):
+        for offset, bnsh in find_embedded_bnsh(data):
+            yield from walk_container(bnsh, name + f"!BNSH@{offset:x}", depth + 1, dictionaries)
+    elif magic in (b"BNSH", b"CGSB", b"SHN!", b"BAHS"):
+        parser = {b"BNSH": parse_bnsh, b"CGSB": parse_cgsb, b"SHN!": parse_shn, b"BAHS": parse_sharcb}[magic]
         for record in parser(data):
             yield {"member": name, **record}
-    elif name.lower().endswith((".json", ".presetb", ".meminfo", ".tex", ".byml", ".yaml")):
+    elif name.lower().endswith((".json", ".presetb", ".meminfo", ".tex", ".byml", ".yaml", ".raw")):
         return
     else:
         raise ArchiveError(f"unsupported container magic {magic.hex()}")
 
 
-def extract(sources, output):
+def extract(sources, output, dictionaries=None):
+    """Extract unique code and control allocations and return their provenance."""
     programs = {}
     archives = []
     errors = []
@@ -64,7 +70,7 @@ def extract(sources, output):
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 raise ArchiveError("source changed during read")
             archive = {**source, "size": len(data), "sha256": digest(data), "records": 0}
-            for record in walk_container(data, path.name):
+            for record in walk_container(data, path.name, dictionaries=dictionaries):
                 if "error" in record:
                     errors.append({**source, **record})
                     continue
@@ -86,8 +92,8 @@ def extract(sources, output):
                         "code": code_path.relative_to(output).as_posix(),
                         "control": control_path.relative_to(output).as_posix(),
                         "code_sha256": code_hash, "control_sha256": control_hash,
-                        "format": "native-header" if record["stage"] in
-                                  ("vertex", "tess-control", "tess-eval", "geometry", "fragment") else None,
+                        "format": "native-header" if "envelope" not in record and record["stage"] in
+                                  ("vertex", "tess-control", "tess-eval", "geometry", "fragment", "task", "mesh") else None,
                         "context": "archive header only; runtime resources unavailable",
                         "origins": [],
                     }
@@ -100,11 +106,14 @@ def extract(sources, output):
 
 
 def main():
+    """Validate local extraction paths and write the shader manifest."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inventory", type=Path)
     parser.add_argument("--source", action="append", default=[], metavar="TITLE_ID=PATH")
     parser.add_argument("--read-only-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--zstd-dictionary-pack", type=Path,
+                        help="ZsDic.pack.zs or its decompressed SARC from the same dump")
     args = parser.parse_args()
     library = args.read_only_root.resolve()
     output = args.output.resolve()
@@ -147,8 +156,19 @@ def main():
             parser.error(f"source is outside the declared read-only root: {path}")
         if not re.fullmatch("[0-9a-fA-F]{16}", source["title_id"]):
             parser.error("invalid inventory title id")
+    dictionaries = None
+    if args.zstd_dictionary_pack:
+        dictionary_pack = args.zstd_dictionary_pack.resolve()
+        if library not in dictionary_pack.parents:
+            parser.error("dictionary pack must be inside the declared read-only root")
+        try:
+            if dictionary_pack.stat().st_size > MAX_ALLOCATION:
+                raise ArchiveError("dictionary pack exceeds the in-memory limit")
+            dictionaries = read_zstd_dictionaries(dictionary_pack.read_bytes())
+        except (ArchiveError, OSError, ValueError) as exc:
+            parser.error(str(exc))
     output.mkdir(parents=True, exist_ok=True)
-    result = extract(sources, output)
+    result = extract(sources, output, dictionaries)
     result["errors"].extend(coverage_errors)
     (output / "manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps({"archives": len(result["archives"]), "programs": len(result["programs"]),

@@ -28,6 +28,7 @@ def header(stage):
 
 
 def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
+    """Encode a synthetic captured shader for offline CLI tests."""
     code = bytearray(header(stage))
     for instruction in instructions:
         if len(code) % 32 == 0:
@@ -44,6 +45,8 @@ def environment(version, stage, instructions=(MAXWELL_EXIT,), formats=()):
     record += struct.pack("<4I", 1, 1, 1, 0) if stage == 5 else header(stage)
     if stage == 3:
         record += bytes(32)
+    if version >= 53 and stage in (7, 8):
+        record += struct.pack("<3I", 32, 64, 128) + header(0)
     return record
 
 
@@ -307,7 +310,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(sum(op == 218 for op, _ in emitted), 1)
 
     def test_both_cache_versions_all_stages(self):
-        for version in (46, 47, 48, 49, 50, 51, 52):
+        """Validate ordinary stage output for each supported cache version."""
+        for version in (46, 47, 48, 49, 50, 51, 52, 53):
             for stage, name in enumerate(STAGES):
                 with self.subTest(version=version, stage=name):
                     capture = self.write("shader.env", environment(version, stage))
@@ -316,6 +320,20 @@ class CliTests(unittest.TestCase):
                     models = [args[0] for op, args in spirv_instructions(self.output.read_bytes()) if op == 15]
                     self.assertEqual(models, [stage])
                     self.validate()
+
+    def test_v53_mesh_context_is_parsed_before_the_offline_support_check(self):
+        """Distinguish intact mesh metadata from a truncated capture."""
+        for stage, name in ((7, "task"), (8, "mesh")):
+            capture = self.write("mesh.env", environment(53, stage))
+            result = self.run_cli("--environment", capture, "--cache-version", 53,
+                                  "--output", self.output, code=1)
+            self.assertEqual(result["stage"], name)
+            self.assertEqual(result["phase"], "context")
+            self.assertIn("additional pipeline stage context", result["error"]["message"])
+            capture = self.write("mesh.env", environment(53, stage)[:-1])
+            result = self.run_cli("--environment", capture, "--cache-version", 53,
+                                  "--output", self.output, code=2)
+            self.assertEqual(result["error"]["message"], "Truncated environment record")
 
     def test_raw_overlay(self):
         capture = self.write("shader.env", environment(47, 4))

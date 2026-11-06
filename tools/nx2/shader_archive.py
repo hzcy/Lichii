@@ -68,6 +68,7 @@ def parse_sarc(data: bytes) -> list[tuple[str, bytes]]:
 
 
 def parse_bnsh(data: bytes) -> list[dict]:
+    """Read bounded NVN2 allocations and validate stage metadata."""
     _range(data, 0, 0x98)
     if data[:8] != b"BNSH\0\0\0\0" or data[0x60:0x64] != b"grsc":
         raise ArchiveError("invalid BNSH header")
@@ -95,8 +96,12 @@ def parse_bnsh(data: bytes) -> list[dict]:
         if not program:
             raise ArchiveError("missing BNSH variation program")
         _range(data, program, 0x38)
-        for index, stage in enumerate(stages):
-            record = u64(program + 8 + index * 8)
+        slots = list(zip(range(8, 0x38, 8), stages))
+        if version == (1, 4, 2, 0) and u64(program) == 2:
+            _range(data, program, 0x50)
+            slots.extend(((0x40, "task"), (0x48, "mesh")))
+        for index, (slot, stage) in enumerate(slots):
+            record = u64(program + slot)
             if not record:
                 continue
             _range(data, record, 0x40)
@@ -106,10 +111,17 @@ def parse_bnsh(data: bytes) -> list[dict]:
                 raise ArchiveError("invalid BNSH stage data pointer or size")
             code = _range(data, code_offset, code_size)
             control = _range(data, control_offset, control_size)
-            if index != 5:
+            if stage != "compute":
                 if len(code) <= 128 or (len(code) - 128) % 16:
                     raise ArchiveError("invalid native graphics code size")
-                if (struct.unpack_from("<I", code)[0] >> 10) & 15 != index + 1:
+                header_type = (struct.unpack_from("<I", code)[0] >> 10) & 15
+                if stage in ("task", "mesh"):
+                    expected = 6 if stage == "task" else 7
+                    if (len(control) < 88 or control[:8] != bytes.fromhex("34127698c9000000")
+                            or u32(control_offset + 84) >> 16 != expected
+                            or header_type not in ((1,) if stage == "task" else (1, 3))):
+                        raise ArchiveError("invalid BNSH task/mesh stage metadata")
+                elif header_type != index + 1:
                     raise ArchiveError("BNSH graphics stage disagrees with native header")
             result.append(dict(variation=variation, stage=stage, code=code, control=control,
                                code_offset=code_offset, control_offset=control_offset,
@@ -123,6 +135,11 @@ def find_bnsh(data: bytes) -> list[tuple[int, bytes]]:
         raise ArchiveError("not a BFSHA archive")
     if data[0xc:0xe] != b"\xff\xfe" or struct.unpack_from("<I", data, 0x1c)[0] != len(data):
         raise ArchiveError("invalid BFSHA byte order or size")
+    return find_embedded_bnsh(data)
+
+
+def find_embedded_bnsh(data: bytes) -> list[tuple[int, bytes]]:
+    """Return validated BNSH allocations embedded in a known container."""
     result = []
     offset = 0
     while True:
@@ -138,5 +155,5 @@ def find_bnsh(data: bytes) -> list[tuple[int, bytes]]:
         result.append((offset, bnsh))
         offset += size
     if not result:
-        raise ArchiveError("BFSHA contains no supported BNSH")
+        raise ArchiveError("container contains no supported BNSH")
     return result

@@ -38,12 +38,17 @@ new lowering no longer produces the exact bytes stored in the older cache.
 
 ## Inputs and coverage
 
-The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 50. It verifies each
+The loader reads little-endian `yuzucach` Vulkan caches, fork versions 46 through 53. It verifies each
 record boundary and rejects unknown versions or truncated input. Version 47 includes captured
 storage-pointer classifications; versions 48 through 50 retain that layout and version 46 omits them.
 Version 49 invalidates pipelines after tessellation patch-size clamping. Version 50 captures the
 additional texture-table context needed by dynamic texture/static sampler composition. Neither
 changes the serialized layout.
+Version 53 stores the three mesh registers and the 80-byte mesh primitive header
+for task/mesh environments. It uses a separate Vulkan environment-cache filename;
+the runtime must support v53 to load those entries.
+The offline reader preserves that context, but standalone task/mesh compilation
+still reports an explicit context limitation rather than emitting a guessed module.
 Graphics keys are the 1,056-byte layout
 from these versions; compute keys contain 24 bytes. Driver pipeline blobs and `vulkan_used`
 indexes do not contain replayable shader environments and are not treated as shader inputs.
@@ -89,3 +94,43 @@ defects. Each records its source cache hash and byte offset. Run them with:
 ```sh
 python3 tools/shader-sweep/test_captured.py /path/to/shader-sweep
 ```
+
+## Playthrough hints
+
+Use `nup-shader-export` and `extract_static_shaders.py` to produce the local
+archive manifests. BAHS v11 and BFSHA are supported. For archives compressed
+with a game dictionary, pass `--zstd-dictionary-pack` to the extractor
+(Python 3.14 or `backports.zstd`).
+
+Close the emulator before exporting. The hint file contains pipeline keys,
+captured translation metadata, and shader fingerprints. It excludes shader
+instruction bytes, saves, and driver cache blobs. Specify the exact game update
+for both commands. Use hints from a trusted source: the pipeline metadata
+comes from the recording even though the shader code is rebuilt locally.
+
+```sh
+python tools/nx2/playthrough_hints.py export \
+    --title 0400486024dec000 --game-version 131072 \
+    --cache /path/to/0400486024dec000/vulkan.fork-v52.bin \
+    --output /path/to/zelda.hints.json
+
+python tools/nx2/playthrough_hints.py import \
+    --title 0400486024dec000 --game-version 131072 \
+    --hints /path/to/zelda.hints.json --manifest /path/to/static/manifest.json \
+    --compiler /path/to/shader-sweep --output /path/to/rebuilt-cache
+```
+
+Zelda's NVN2 `.vsetb.byml.zs` effect bundles may contain additional embedded
+BNSH graphics and compute programs. Include the shared effects bundle and
+relevant scene bundles in the local extraction inputs.
+
+Pass each local extraction manifest with a separate `--manifest`. The importer
+requires an exact packed shader match for every stage and reports incomplete
+pipelines separately. NVN2 BNSH and BAHS task and mesh records can supply
+the local code for v53 hints. The importer keeps the recorded mesh context and
+requires an exact packed-code match for every stage, including the fragment
+shader. The result is a new cache directory. For testing,
+copy the resulting title directory into an empty portable profile's
+`user/cache/shader` and launch with `EDEN_NX2_PRELOAD_ALL_PIPELINES=1`. The
+cache format and pipeline state must be compatible with the recipient's build
+and Vulkan features.

@@ -10,7 +10,7 @@ import ctypes.util
 import struct
 import zlib
 
-from shader_archive import ArchiveError
+from shader_archive import ArchiveError, parse_sarc
 
 
 MAX_ALLOCATION = 512 * 1024 * 1024
@@ -23,10 +23,41 @@ def extent(data, offset, size):
     return data[offset:offset + size]
 
 
-def zstd_decompress(data):
+def zstd_module():
+    """Find a Python Zstandard module with dictionary support."""
     try:
         from compression import zstd
     except ImportError:
+        try:
+            from backports import zstd
+        except ImportError:
+            return None
+    return zstd
+
+
+def read_zstd_dictionaries(data):
+    """Index the game dictionary pack by Zstandard dictionary ID."""
+    zstd = zstd_module()
+    if zstd is None:
+        raise ArchiveError("dictionary packs require Python 3.14 or backports.zstd")
+    archive = zstd_decompress(data) if data.startswith(b"\x28\xb5\x2f\xfd") else data
+    dictionaries = {}
+    for name, member in parse_sarc(archive):
+        if not member.startswith(b"\x37\xa4\x30\xec"):
+            continue
+        dictionary = zstd.ZstdDict(member)
+        if dictionary.dict_id in dictionaries:
+            raise ArchiveError(f"duplicate zstd dictionary ID {dictionary.dict_id} in {name}")
+        dictionaries[dictionary.dict_id] = dictionary
+    if not dictionaries:
+        raise ArchiveError("no zstd dictionaries found in the pack")
+    return dictionaries
+
+
+def zstd_decompress(data, dictionaries=None):
+    """Decode a bounded frame using its declared dictionary when needed."""
+    zstd = zstd_module()
+    if zstd is None:
         library = ctypes.CDLL(ctypes.util.find_library("zstd"))
         library.ZSTD_getFrameContentSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
         library.ZSTD_getFrameContentSize.restype = ctypes.c_ulonglong
@@ -40,12 +71,20 @@ def zstd_decompress(data):
         if actual != size:
             raise ArchiveError("zstd decompression failed; a dictionary may be required")
         return output.raw[:actual]
-    size = zstd.get_frame_info(data).decompressed_size
-    if size is None or size > MAX_ALLOCATION:
-        raise ArchiveError("unknown or excessive zstd decompressed size")
-    result = zstd.ZstdDecompressor().decompress(data, max_length=size + 1)
-    if len(result) != size:
-        raise ArchiveError("zstd decompressed size mismatch")
+    try:
+        info = zstd.get_frame_info(data)
+        size = info.decompressed_size
+        if size is None or size > MAX_ALLOCATION:
+            raise ArchiveError("unknown or excessive zstd decompressed size")
+        dictionary = (dictionaries or {}).get(info.dictionary_id)
+        if info.dictionary_id and dictionary is None:
+            raise ArchiveError(f"zstd dictionary {info.dictionary_id} is required")
+        decoder = zstd.ZstdDecompressor(zstd_dict=dictionary)
+        result = decoder.decompress(data, max_length=size + 1)
+    except zstd.ZstdError as exc:
+        raise ArchiveError(f"zstd decompression failed: {exc}") from exc
+    if not decoder.eof or decoder.unused_data or len(result) != size:
+        raise ArchiveError("zstd decompressed size mismatch or trailing input")
     return result
 
 
@@ -235,3 +274,72 @@ def parse_shn(data):
     if not result:
         raise ArchiveError("SHDROUNC contains no supported shader records")
     return result
+
+
+def parse_sharcb(data):
+    """Read the NVN2 AGL BAHS v11 variant with its separate metadata and code pools."""
+    extent(data, 0, 32)
+    version, size, platform, flags, metadata_base, pool_size, pool = struct.unpack_from("<7I", data, 4)
+    if (data[:4], version, platform, flags) != (b"BAHS", 11, 5, 0) or size != len(data):
+        raise ArchiveError("unsupported BAHS version, platform or file size")
+    table = metadata_base + 0x150
+    if metadata_base < 32 or table + 8 > pool or pool + pool_size != size:
+        raise ArchiveError("invalid BAHS metadata or code pool")
+    table_size, count = struct.unpack_from("<II", data, table)
+    end = table + table_size
+    if not count or table_size < 8 or end > pool or count > (table_size - 8) // 32:
+        raise ArchiveError("invalid BAHS record table")
+    stages = {0: ("vertex", 0), 1: ("fragment", 1), 3: ("compute", 5),
+              4: ("task", 6), 5: ("mesh", 7)}
+    records = []
+    allocations = {}
+    cursor = table + 8
+    for index in range(count):
+        if cursor + 32 > end:
+            raise ArchiveError("truncated BAHS record header")
+        length, slot, _, body_size = struct.unpack_from("<4I", data, cursor)
+        descriptor = cursor + 16
+        code_relative, control_size, control_relative = struct.unpack_from("<QIi", data, descriptor)
+        if length < 32 or body_size != length - 16 or cursor + length > end:
+            raise ArchiveError("invalid BAHS record size")
+        if slot not in stages:
+            raise ArchiveError(f"unsupported BAHS shader slot {slot}")
+        # A shared control can be referenced backwards from a later descriptor.
+        control_offset = descriptor + control_relative
+        if control_size < 104 or control_offset < table + 8 or control_offset + control_size > end:
+            raise ArchiveError("invalid BAHS control extent")
+        control = data[control_offset:control_offset + control_size]
+        stage, expected_type = stages[slot]
+        if (control[:8] != bytes.fromhex("34127698c9000000") or
+                struct.unpack_from("<I", control, 84)[0] >> 16 != expected_type):
+            raise ArchiveError("BAHS record disagrees with the NVN2 control stage or version")
+        declared, _, instruction_allocation, allocation = struct.unpack_from("<4I", control, 56)
+        if (not declared or declared % 16 or instruction_allocation % 16 or
+                not declared <= instruction_allocation <= allocation or
+                code_relative + allocation > pool_size):
+            raise ArchiveError("invalid BAHS code extent")
+        code_offset = pool + code_relative
+        code_size = declared if stage == "compute" else instruction_allocation
+        location = (code_offset, code_size)
+        if location not in allocations:
+            allocations[location] = data[code_offset:code_offset + code_size]
+        code = allocations[location]
+        origin = {"variation": index, "slot": slot, "record_offset": cursor,
+                  "code_offset": code_offset, "control_offset": control_offset}
+        if stage in ("task", "mesh"):
+            header_type = (struct.unpack_from("<I", extent(code, 0, 4))[0] >> 10) & 15
+            if (len(code) <= 128 or (len(code) - 128) % 16 or
+                    header_type not in ((1,) if stage == "task" else (1, 3))):
+                raise ArchiveError("invalid BAHS task/mesh graphics envelope")
+            item = {"stage": stage, "code": code, "control": control, **origin}
+        elif stage == "compute":
+            item = {"stage": stage, "code": code, "control": control, **origin}
+        else:
+            item = graphics_record(code, control, **origin)
+            if item["stage"] != stage:
+                raise ArchiveError("BAHS record disagrees with the graphics header stage")
+        records.append(item)
+        cursor += length
+    if cursor != end:
+        raise ArchiveError("trailing bytes in BAHS record table")
+    return records

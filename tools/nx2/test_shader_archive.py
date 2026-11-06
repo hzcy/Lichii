@@ -2,6 +2,7 @@ import struct
 import unittest
 
 from shader_archive import ArchiveError, find_bnsh, parse_bnsh, parse_sarc
+from extract_static_shaders import walk_container
 
 
 def bnsh(stage=0):
@@ -46,6 +47,37 @@ class ShaderArchiveTests(unittest.TestCase):
             self.assertEqual(len(row["code"]), 0x100)
             self.assertEqual(row["control"], b"ctrl")
             self.assertEqual(row["version"], (0, 4, 2, 0))
+
+    def test_v142_task_and_mesh_use_extended_slots_and_control_stage(self):
+        """Check both mesh header variants and reject mismatched control stages."""
+        for slot, control_stage, header_type, expected in (
+                (0x40, 6, 1, "task"), (0x48, 7, 1, "mesh"), (0x48, 7, 3, "mesh")):
+            with self.subTest(stage=expected, header=header_type):
+                data = bytearray(bnsh())
+                data[8:12] = bytes((1, 4, 2, 0))
+                struct.pack_into("<QQ", data, 0x100, 2, 0)
+                data[0x140:0x150] = bytes(16)
+                struct.pack_into("<Q", data, 0x100 + slot, 0x150)
+                struct.pack_into("<QQII", data, 0x158, 0x300, 0x200, 0x100, 104)
+                data[0x300:0x308] = bytes.fromhex("34127698c9000000")
+                struct.pack_into("<I", data, 0x354, control_stage << 16)
+                struct.pack_into("<I", data, 0x200, header_type << 10)
+                row, = parse_bnsh(bytes(data))
+                self.assertEqual(row["stage"], expected)
+                struct.pack_into("<I", data, 0x354, 5 << 16)
+                with self.assertRaises(ArchiveError):
+                    parse_bnsh(bytes(data))
+
+    def test_effect_bundle_extracts_embedded_graphics_and_compute(self):
+        """Check extraction stays scoped to effects bundles and rejects truncation."""
+        header = b"YB\x05\x00" + bytes(12)
+        data = header + bnsh() + bytes(48) + bnsh(5)
+        records = list(walk_container(data, "effects.vsetb.byml"))
+        self.assertEqual([record["stage"] for record in records], ["vertex", "compute"])
+        self.assertTrue(records[0]["member"].endswith("!BNSH@10"))
+        self.assertEqual(list(walk_container(data, "unrelated.byml")), [])
+        with self.assertRaises(ArchiveError):
+            list(walk_container(data[:-1], "effects.vsetb.byml"))
 
     def test_bad_bnsh(self):
         for offset, value, fmt in ((0x7c, 0xffffffff, "I"), (0xd0, 0x3ff, "Q"),

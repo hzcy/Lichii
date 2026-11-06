@@ -9,7 +9,7 @@ import unittest
 import zlib
 
 from shader_archive import ArchiveError
-from shader_containers import dcx_decompress, lz4_block, parse_bnd4, parse_cgsb, parse_shn
+from shader_containers import dcx_decompress, lz4_block, parse_bnd4, parse_cgsb, parse_sharcb, parse_shn
 
 
 def graphics(stage):
@@ -31,6 +31,61 @@ def literals(data):
         return bytes([size << 4]) + data
     remaining = size - 15
     return b"\xf0" + b"\xff" * (remaining // 255) + bytes([remaining % 255]) + data
+
+
+
+def sharcb(slot=0):
+    """Two records reference one control and one code allocation."""
+    section, pool = 0x200, 0x600
+    table = section + 0x150
+    first = table + 8
+    second = first + 0x100
+    end = second + 0x80
+    control = first + 0x50
+    allocation = 0x100
+    data = bytearray(pool + allocation)
+    data[:4] = b"BAHS"
+    struct.pack_into("<7I", data, 4, 11, len(data), 5, 0, section, allocation, pool)
+    struct.pack_into("<II", data, table, end - table, 2)
+    for start, length in [(first, second - first), (second, end - second)]:
+        struct.pack_into("<4IQIi", data, start, length, slot, 0, length - 16,
+                         0, 104, control - (start + 16))
+    data[control:control + 8] = bytes.fromhex("34127698c9000000")
+    payload = bytes(range(16)) if slot == 3 else graphics(0)
+    data[pool:pool + len(payload)] = payload
+    struct.pack_into("<4I", data, control + 56, len(payload), 0, allocation, allocation)
+    struct.pack_into("<I", data, control + 84, (5 if slot == 3 else 0) << 16)
+    return data, first, second, control
+
+
+class SharcbTests(unittest.TestCase):
+    def test_graphics_alias_uses_signed_control_offset(self):
+        """Verify two records can point backwards to the same control block."""
+        data, _, _, control = sharcb()
+        records = parse_sharcb(data)
+        self.assertEqual([item["stage"] for item in records], ["vertex", "vertex"])
+        self.assertEqual([item["control_offset"] for item in records], [control, control])
+        self.assertEqual(records[0]["code"], records[1]["code"])
+        self.assertEqual(records[0]["code"][:144], graphics(0))
+
+    def test_compute_uses_declared_extent_without_graphics_header(self):
+        """Check compute instructions exclude allocation padding."""
+        data, _, _, _ = sharcb(3)
+        for item in parse_sharcb(data):
+            self.assertEqual(item["stage"], "compute")
+            self.assertEqual(item["code"], bytes(range(16)))
+
+    def test_rejects_cross_pool_or_invalid_control(self):
+        """Reject descriptors that leave their pools or disagree with the stage."""
+        data, first, second, control = sharcb()
+        for offset, value in [(8, len(data) + 1), (first, 0), (first + 16, 1),
+                              (second + 28, 0x80000000), (control + 56, 0),
+                              (control + 84, 5 << 16), (first - 4, 1)]:
+            with self.subTest(offset=offset):
+                invalid = bytearray(data)
+                struct.pack_into("<I", invalid, offset, value)
+                with self.assertRaises(ArchiveError):
+                    parse_sharcb(invalid)
 
 
 class ContainerTests(unittest.TestCase):

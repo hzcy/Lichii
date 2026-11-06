@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay native shader captures and v46-v50 pipeline caches without a GPU."""
+"""Replay native shader captures and v46-v53 pipeline caches without a GPU."""
 
 import argparse
 from collections import Counter, defaultdict
@@ -23,7 +23,7 @@ GAMES = {
     "04007ef01f8ae000": "Fire Emblem: Fortune's Weave",
     "0400c3f00006e000": "Mario Kart World",
     "04008e001f098000": "Nintendo Switch Sports Resort",
-    "0400a3a01ee4c000": "Pokémon Pokopia",
+    "0400a3a01ee4c000": "PokÃ©mon Pokopia",
     "0400a4802437e000": "Drag x Drive Global Jam",
     "040041e0212ae000": "Fast Fusion",
     "04005b902517c000": "Kirby Air Riders Global Test Ride",
@@ -47,10 +47,11 @@ def digest(data):
 
 
 def parse_cache(data):
+    """Yield shader environments with their original pipeline keys."""
     if len(data) < 12 or data[:8] != b"yuzucach":
         raise CacheError("not a serialized shader-environment cache")
     version, = struct.unpack_from("<I", data, 8)
-    if version not in (46, 47, 48, 49, 50):
+    if version not in (46, 47, 48, 49, 50, 51, 52, 53):
         raise CacheError(f"unsupported cache version {version}")
     cursor = 12
     entry = 0
@@ -80,7 +81,11 @@ def parse_cache(data):
             code = data[cursor:cursor + code_size]
             cursor += code_size + textures * 8 + formats * 8 + constants * 12
             cursor += pointers * 9 + replacements * 12
+            if stage in (7, 8) and version < 53:
+                raise CacheError("task/mesh environments require cache version 53")
             cursor += 16 if stage == 5 else 80 + (32 if stage == 3 else 0)
+            if stage in (7, 8):
+                cursor += 92  # Three mesh registers and the primitive program header.
             if cursor > len(data):
                 raise CacheError(f"truncated environment at {begin}")
             environments.append({"version": version, "entry": entry, "index": index,
