@@ -95,7 +95,9 @@ std::vector<std::filesystem::path> SearchDirs() {
 
 template <typename T>
 bool Resolve(HMODULE module, const char* name, T*& function) {
-    function = reinterpret_cast<T*>(GetProcAddress(module, name));
+    // Two-step cast through void*: clang-cl rejects a direct FARPROC to function pointer
+    // conversion that MSVC accepts.
+    function = reinterpret_cast<T*>(reinterpret_cast<void*>(GetProcAddress(module, name)));
     if (!function) {
         LOG_ERROR(Render_Vulkan, "sl.interposer.dll has no {}", name);
     }
@@ -437,7 +439,8 @@ bool AttachDevice(VkInstance instance, VkPhysicalDevice physical, VkDevice devic
     // Manual hooking: Streamline does its per-frame work in these.
     const auto hook = [&](auto& function, const char* name) {
         if (const FARPROC proxy = GetProcAddress(state.module, name)) {
-            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(proxy);
+            function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
+                reinterpret_cast<void*>(proxy));
         } else {
             LOG_WARNING(Render_Vulkan, "sl.interposer.dll has no {}", name);
         }

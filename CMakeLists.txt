@@ -542,7 +542,9 @@ if (APPLE)
     endforeach()
 elseif (WIN32)
     # Target Windows 10
-    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00)
+    # NOMINMAX keeps windows.h from defining min/max macros that break std::min/std::max under
+    # clang-cl; WIN32_LEAN_AND_MEAN keeps the same headers out of unrelated translation units.
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN)
     set(PLATFORM_LIBRARIES ${PLATFORM_LIBRARIES} winmm iphlpapi ws2_32 wlanapi)
     if (MINGW)
         # PSAPI is the Process Status API
